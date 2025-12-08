@@ -28,3 +28,5 @@ VOLUME /root/.cache/huggingface/hub/
 EXPOSE 7860
 
 WORKDIR /workspace/F5-TTS
+
+CMD ["python", "-m", "f5_tts.infer.infer_gradio", "--host", "0.0.0.0", "--port", "7860"]
