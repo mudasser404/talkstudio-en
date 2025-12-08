@@ -2,8 +2,6 @@ FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
 
 USER root
 
-# Updated for Gradio 6.0 compatibility
-
 ARG DEBIAN_FRONTEND=noninteractive
 
 LABEL github_repo="https://github.com/SWivid/F5-TTS"
