@@ -21,7 +21,8 @@ WORKDIR /workspace
 RUN git clone https://github.com/SWivid/F5-TTS.git \
     && cd F5-TTS \
     && git submodule update --init --recursive \
-    && pip install -e . --no-cache-dir
+    && pip install -e . --no-cache-dir \
+    && pip install runpod --no-cache-dir
 
 ENV SHELL=/bin/bash
 
@@ -34,4 +35,8 @@ EXPOSE 7860
 
 WORKDIR /workspace/F5-TTS
 
-CMD ["python", "-m", "f5_tts.infer.infer_gradio", "--host", "0.0.0.0", "--port", "7860", "--share"]
+# Copy handler file
+COPY handler.py /workspace/F5-TTS/handler.py
+
+# Default CMD for serverless, can be overridden for Gradio
+CMD ["python", "-u", "handler.py"]
