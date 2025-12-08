@@ -151,11 +151,25 @@ def generate_speech(job):
             # Convert to WAV if not already WAV
             if url_ext not in [".wav", ".wave"]:
                 print(f"Converting {url_ext} to WAV...")
-                audio, sr = torchaudio.load(temp_download)
+                # Use ffmpeg directly for better compatibility
+                import subprocess
+
                 wav_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-                torchaudio.save(wav_path, audio, sr)
-                ref_audio_path = wav_path
-                os.unlink(temp_download)  # Clean up temp download
+                try:
+                    subprocess.run(
+                        ["ffmpeg", "-i", temp_download, "-ar", "24000", "-ac", "1", "-y", wav_path],
+                        check=True,
+                        capture_output=True,
+                    )
+                    ref_audio_path = wav_path
+                    os.unlink(temp_download)  # Clean up temp download
+                except subprocess.CalledProcessError as e:
+                    print(f"FFmpeg conversion failed: {e.stderr.decode()}")
+                    # Fallback: try torchaudio
+                    audio, sr = torchaudio.load(temp_download)
+                    torchaudio.save(wav_path, audio, sr)
+                    ref_audio_path = wav_path
+                    os.unlink(temp_download)
             else:
                 ref_audio_path = temp_download
 
