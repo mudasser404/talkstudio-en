@@ -23,10 +23,13 @@ RUN git clone https://github.com/SWivid/F5-TTS.git \
 
 ENV SHELL=/bin/bash
 
+# Pre-download models and cache them
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='SWivid/F5-TTS', allow_patterns=['F5TTS_Base/*', 'E2TTS_Base/*'])" || echo "Model download will happen at runtime"
+
 VOLUME /root/.cache/huggingface/hub/
 
 EXPOSE 7860
 
 WORKDIR /workspace/F5-TTS
 
-CMD ["python", "-m", "f5_tts.infer.infer_gradio", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["python", "-m", "f5_tts.infer.infer_gradio", "--host", "0.0.0.0", "--port", "7860", "--share"]
