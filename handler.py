@@ -8,6 +8,7 @@ import torchaudio
 import numpy as np
 import tempfile
 import base64
+import requests
 from pathlib import Path
 from f5_tts.infer.utils_infer import (
     infer_process,
@@ -33,7 +34,7 @@ def initialize_models():
         print("Loading F5-TTS model...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Load model
+        # Model configuration
         model_cfg = dict(
             dim=1024,
             depth=22,
@@ -43,12 +44,19 @@ def initialize_models():
             conv_layers=4
         )
 
-        model = DiT(**model_cfg).to(device)
-
-        # Load checkpoint
+        # Load checkpoint with correct parameters
         ckpt_path = "hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors"
         print(f"Loading checkpoint from {ckpt_path}")
-        model = load_model(model, ckpt_path, device)
+
+        model = load_model(
+            model_cls=DiT,
+            model_cfg=model_cfg,
+            ckpt_path=ckpt_path,
+            mel_spec_type="vocos",
+            vocab_file="",
+            use_ema=True,
+            device=device
+        )
 
         # Load vocoder
         print("Loading vocoder...")
@@ -80,10 +88,14 @@ def generate_speech(job):
 
         # Extract parameters
         gen_text = job_input.get("text", "")
-        ref_audio_b64 = job_input.get("ref_audio", None)
+        ref_audio_b64 = job_input.get("ref_audio_base64", None)
+        ref_audio_url = job_input.get("ref_audio_url", None)
         ref_text = job_input.get("ref_text", "")
-        remove_silence = job_input.get("remove_silence", True)
+        remove_silence = job_input.get("remove_silence", False)
         speed = job_input.get("speed", 1.0)
+        nfe_step = job_input.get("nfe_step", 32)
+        cfg_strength = job_input.get("cfg_strength", 2.0)
+        sway_sampling_coef = job_input.get("sway_sampling_coef", -1.0)
 
         if not gen_text:
             return {"error": "No text provided"}
@@ -92,9 +104,18 @@ def generate_speech(job):
         ref_audio_path = None
         if ref_audio_b64:
             # Decode base64 audio
+            print("Decoding base64 audio...")
             audio_data = base64.b64decode(ref_audio_b64)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
                 temp_audio.write(audio_data)
+                ref_audio_path = temp_audio.name
+        elif ref_audio_url:
+            # Download audio from URL
+            print(f"Downloading audio from {ref_audio_url}...")
+            response = requests.get(ref_audio_url)
+            response.raise_for_status()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+                temp_audio.write(response.content)
                 ref_audio_path = temp_audio.name
 
         # Preprocess reference audio
