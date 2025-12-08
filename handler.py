@@ -150,26 +150,38 @@ def generate_speech(job):
 
             # Convert to WAV if not already WAV
             if url_ext not in [".wav", ".wave"]:
-                print(f"Converting {url_ext} to WAV...")
+                print(f"Converting {url_ext} to WAV using ffmpeg...")
                 # Use ffmpeg directly for better compatibility
                 import subprocess
 
                 wav_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-                try:
-                    subprocess.run(
-                        ["ffmpeg", "-i", temp_download, "-ar", "24000", "-ac", "1", "-y", wav_path],
-                        check=True,
-                        capture_output=True,
-                    )
-                    ref_audio_path = wav_path
-                    os.unlink(temp_download)  # Clean up temp download
-                except subprocess.CalledProcessError as e:
-                    print(f"FFmpeg conversion failed: {e.stderr.decode()}")
-                    # Fallback: try torchaudio
-                    audio, sr = torchaudio.load(temp_download)
-                    torchaudio.save(wav_path, audio, sr)
-                    ref_audio_path = wav_path
+                result = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-i",
+                        temp_download,
+                        "-ar",
+                        "24000",
+                        "-ac",
+                        "1",
+                        "-y",
+                        wav_path,
+                        "-loglevel",
+                        "error",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+
+                if result.returncode != 0:
+                    error_msg = f"FFmpeg conversion failed: {result.stderr}"
+                    print(error_msg)
                     os.unlink(temp_download)
+                    return {"error": error_msg}
+
+                ref_audio_path = wav_path
+                os.unlink(temp_download)  # Clean up temp download
+                print(f"Conversion successful: {wav_path}")
             else:
                 ref_audio_path = temp_download
 
