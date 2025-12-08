@@ -160,7 +160,7 @@ def generate_speech(job):
                 ref_audio_path = temp_download
 
         # Preprocess reference audio
-        ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_path, ref_text, device=device)
+        ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_path, ref_text)
 
         # Generate audio
         print(f"Generating speech for: {gen_text[:50]}...")
