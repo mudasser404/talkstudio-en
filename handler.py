@@ -10,6 +10,7 @@ import tempfile
 import base64
 import requests
 from pathlib import Path
+from cached_path import cached_path
 from f5_tts.infer.utils_infer import (
     infer_process,
     load_model,
@@ -44,9 +45,11 @@ def initialize_models():
             conv_layers=4
         )
 
-        # Load checkpoint with correct parameters
-        ckpt_path = "hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors"
-        print(f"Loading checkpoint from {ckpt_path}")
+        # Download and cache checkpoint
+        ckpt_url = "https://huggingface.co/SWivid/F5-TTS/resolve/main/F5TTS_Base/model_1200000.safetensors"
+        print(f"Downloading checkpoint from HuggingFace...")
+        ckpt_path = str(cached_path(ckpt_url))
+        print(f"Checkpoint cached at: {ckpt_path}")
 
         model = load_model(
             model_cls=DiT,
