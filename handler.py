@@ -59,7 +59,20 @@ def initialize_models():
         # Download and cache checkpoint
         ckpt_url = "https://huggingface.co/SWivid/F5-TTS/resolve/main/F5TTS_Base/model_1200000.safetensors"
         print(f"Downloading checkpoint from HuggingFace...")
-        ckpt_path = str(cached_path(ckpt_url))
+
+        # Use cached_path with explicit extension preservation
+        import os
+        cached_file = cached_path(ckpt_url)
+
+        # Rename to preserve .safetensors extension if needed
+        if not str(cached_file).endswith('.safetensors'):
+            new_path = str(cached_file) + '.safetensors'
+            if not os.path.exists(new_path):
+                os.symlink(cached_file, new_path)
+            ckpt_path = new_path
+        else:
+            ckpt_path = str(cached_file)
+
         print(f"Checkpoint cached at: {ckpt_path}")
 
         model = load_model(
