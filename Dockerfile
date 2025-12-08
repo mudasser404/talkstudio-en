@@ -33,8 +33,9 @@ EXPOSE 7860
 
 WORKDIR /workspace/F5-TTS
 
-# Copy handler file
+# Copy handler and patch files
 COPY handler.py /workspace/F5-TTS/handler.py
+COPY patch_weights_only.py /workspace/F5-TTS/patch_weights_only.py
 
 # Default CMD for serverless, can be overridden for Gradio
 CMD ["python", "-u", "handler.py"]

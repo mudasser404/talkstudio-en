@@ -2,6 +2,18 @@
 RunPod Serverless Handler for F5-TTS
 """
 
+# Patch weights_only issue before importing F5-TTS
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Apply patch
+try:
+    from patch_weights_only import patch_utils_infer
+    patch_utils_infer()
+except Exception as e:
+    print(f"Warning: Could not apply patch: {e}")
+
 import runpod
 import torch
 import torchaudio
@@ -9,7 +21,6 @@ import numpy as np
 import tempfile
 import base64
 import requests
-from pathlib import Path
 from cached_path import cached_path
 from f5_tts.infer.utils_infer import (
     infer_process,
