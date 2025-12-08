@@ -10,6 +10,7 @@ from pathlib import Path
 # Add current directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+
 def test_handler():
     """Test the handler with test.json input"""
 
@@ -17,7 +18,7 @@ def test_handler():
     from handler import generate_speech
 
     # Load test input
-    with open('test.json', 'r') as f:
+    with open("test.json", "r") as f:
         test_data = json.load(f)
 
     print("=" * 60)
@@ -42,12 +43,13 @@ def test_handler():
         if "audio" in result:
             # Save output audio
             import base64
+
             audio_data = base64.b64decode(result["audio"])
             output_file = "test_output.wav"
             with open(output_file, "wb") as f:
                 f.write(audio_data)
 
-            print(f"\n✅ SUCCESS!")
+            print("\n✅ SUCCESS!")
             print(f"   Output saved: {output_file}")
             print(f"   Sample rate: {result['sample_rate']} Hz")
             print(f"   Audio size: {len(audio_data)} bytes")
@@ -59,8 +61,10 @@ def test_handler():
     except Exception as e:
         print(f"\n❌ EXCEPTION: {str(e)}")
         import traceback
+
         traceback.print_exc()
         return False
+
 
 if __name__ == "__main__":
     success = test_handler()

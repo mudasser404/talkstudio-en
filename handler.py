@@ -5,11 +5,13 @@ RunPod Serverless Handler for F5-TTS
 # Patch weights_only issue before importing F5-TTS
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Apply patch
 try:
     from patch_weights_only import patch_utils_infer
+
     patch_utils_infer()
 except Exception as e:
     print(f"Warning: Could not apply patch: {e}")
@@ -17,7 +19,6 @@ except Exception as e:
 import runpod
 import torch
 import torchaudio
-import numpy as np
 import tempfile
 import base64
 import requests
@@ -29,7 +30,7 @@ from f5_tts.infer.utils_infer import (
     preprocess_ref_audio_text,
     remove_silence_for_generated_wav,
 )
-from f5_tts.model import DiT, UNetT
+from f5_tts.model import DiT
 
 
 # Global variables for model caching
@@ -47,26 +48,20 @@ def initialize_models():
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Model configuration
-        model_cfg = dict(
-            dim=1024,
-            depth=22,
-            heads=16,
-            ff_mult=2,
-            text_dim=512,
-            conv_layers=4
-        )
+        model_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)
 
         # Download and cache checkpoint
         ckpt_url = "https://huggingface.co/SWivid/F5-TTS/resolve/main/F5TTS_Base/model_1200000.safetensors"
-        print(f"Downloading checkpoint from HuggingFace...")
+        print("Downloading checkpoint from HuggingFace...")
 
         # Use cached_path with explicit extension preservation
         import os
+
         cached_file = cached_path(ckpt_url)
 
         # Rename to preserve .safetensors extension if needed
-        if not str(cached_file).endswith('.safetensors'):
-            new_path = str(cached_file) + '.safetensors'
+        if not str(cached_file).endswith(".safetensors"):
+            new_path = str(cached_file) + ".safetensors"
             if not os.path.exists(new_path):
                 os.symlink(cached_file, new_path)
             ckpt_path = new_path
@@ -82,7 +77,7 @@ def initialize_models():
             mel_spec_type="vocos",
             vocab_file="",
             use_ema=True,
-            device=device
+            device=device,
         )
 
         # Load vocoder
@@ -120,9 +115,10 @@ def generate_speech(job):
         ref_text = job_input.get("ref_text", "")
         remove_silence = job_input.get("remove_silence", False)
         speed = job_input.get("speed", 1.0)
-        nfe_step = job_input.get("nfe_step", 32)
-        cfg_strength = job_input.get("cfg_strength", 2.0)
-        sway_sampling_coef = job_input.get("sway_sampling_coef", -1.0)
+        # Future parameters for advanced control (not yet implemented)
+        # nfe_step = job_input.get("nfe_step", 32)
+        # cfg_strength = job_input.get("cfg_strength", 2.0)
+        # sway_sampling_coef = job_input.get("sway_sampling_coef", -1.0)
 
         if not gen_text:
             return {"error": "No text provided"}
@@ -144,6 +140,7 @@ def generate_speech(job):
 
             # Determine file extension
             import os
+
             url_ext = os.path.splitext(ref_audio_url)[1].lower()
 
             # Save to temp file with original extension
@@ -152,7 +149,7 @@ def generate_speech(job):
                 temp_download = temp_audio.name
 
             # Convert to WAV if not already WAV
-            if url_ext not in ['.wav', '.wave']:
+            if url_ext not in [".wav", ".wave"]:
                 print(f"Converting {url_ext} to WAV...")
                 audio, sr = torchaudio.load(temp_download)
                 wav_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
@@ -163,9 +160,7 @@ def generate_speech(job):
                 ref_audio_path = temp_download
 
         # Preprocess reference audio
-        ref_audio, ref_text = preprocess_ref_audio_text(
-            ref_audio_path, ref_text, device=device
-        )
+        ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_path, ref_text, device=device)
 
         # Generate audio
         print(f"Generating speech for: {gen_text[:50]}...")
@@ -196,11 +191,7 @@ def generate_speech(job):
             with open(temp_output.name, "rb") as f:
                 audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        return {
-            "audio": audio_b64,
-            "sample_rate": final_sample_rate,
-            "text": gen_text
-        }
+        return {"audio": audio_b64, "sample_rate": final_sample_rate, "text": gen_text}
 
     except Exception as e:
         print(f"Error: {str(e)}")

@@ -3,8 +3,8 @@ Patch script to fix weights_only issue in F5-TTS
 Run this before importing F5-TTS modules
 """
 
-import sys
 from pathlib import Path
+
 
 def patch_utils_infer():
     """Patch utils_infer.py to use weights_only=False"""
@@ -23,6 +23,7 @@ def patch_utils_infer():
         print("✓ Patched utils_infer.py: weights_only=True → weights_only=False")
     else:
         print("✓ utils_infer.py already patched or doesn't need patching")
+
 
 if __name__ == "__main__":
     patch_utils_infer()
