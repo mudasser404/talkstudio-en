@@ -1,11 +1,110 @@
 import base64
 import os
 import tempfile
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
 import runpod
-from f5_tts.api import F5TTS
+
+
+# -------------------------
+# Patch F5-TTS to avoid torchaudio/torchcodec for audio loading
+# -------------------------
+def patch_utils_infer() -> None:
+    """
+    Patch src/f5_tts/infer/utils_infer.py so that:
+
+      audio, sr = torchaudio.load(ref_audio)
+
+    is replaced with a SciPy-based loader, avoiding TorchCodec entirely.
+    """
+    # handler.py will be copied into /workspace/F5-TTS
+    utils_file = Path(__file__).parent / "src" / "f5_tts" / "infer" / "utils_infer.py"
+
+    if not utils_file.exists():
+        print(f"[patch_utils_infer] Warning: {utils_file} not found, skipping patch.")
+        return
+
+    text = utils_file.read_text()
+
+    old_snippet = (
+        "def infer_process(\n"
+        "    ref_audio,\n"
+        "    ref_text,\n"
+        "    gen_text,\n"
+        "    model_obj,\n"
+        "    vocoder,\n"
+        "    mel_spec_type=mel_spec_type,\n"
+        "    show_info=print,\n"
+        "    progress=tqdm,\n"
+        "    target_rms=target_rms,\n"
+        "    cross_fade_duration=cross_fade_duration,\n"
+        "    nfe_step=nfe_step,\n"
+        "    cfg_strength=cfg_strength,\n"
+        "    sway_sampling_coef=sway_sampling_coef,\n"
+        "    speed=speed,\n"
+        "    fix_duration=fix_duration,\n"
+        "    device=device,\n"
+        "):\n"
+        "    # Split the input text into batches\n"
+        "    audio, sr = torchaudio.load(ref_audio)\n"
+    )
+
+    new_snippet = (
+        "def infer_process(\n"
+        "    ref_audio,\n"
+        "    ref_text,\n"
+        "    gen_text,\n"
+        "    model_obj,\n"
+        "    vocoder,\n"
+        "    mel_spec_type=mel_spec_type,\n"
+        "    show_info=print,\n"
+        "    progress=tqdm,\n"
+        "    target_rms=target_rms,\n"
+        "    cross_fade_duration=cross_fade_duration,\n"
+        "    nfe_step=nfe_step,\n"
+        "    cfg_strength=cfg_strength,\n"
+        "    sway_sampling_coef=sway_sampling_coef,\n"
+        "    speed=speed,\n"
+        "    fix_duration=fix_duration,\n"
+        "    device=device,\n"
+        "):\n"
+        "    # Split the input text into batches\n"
+        "    # Load audio with SciPy instead of torchaudio.load to avoid TorchCodec backend\n"
+        "    from scipy.io import wavfile\n"
+        "    import numpy as np\n"
+        "    import torch\n"
+        "\n"
+        "    sr, audio_np = wavfile.read(ref_audio)\n"
+        "\n"
+        "    # Convert to float32 in [-1, 1]\n"
+        "    if np.issubdtype(audio_np.dtype, np.integer):\n"
+        "        max_val = np.iinfo(audio_np.dtype).max\n"
+        "        audio_np = audio_np.astype(np.float32) / max_val\n"
+        "    else:\n"
+        "        audio_np = audio_np.astype(np.float32)\n"
+        "\n"
+        "    if audio_np.ndim == 1:\n"
+        "        audio = torch.from_numpy(audio_np).unsqueeze(0)  # (1, T)\n"
+        "    else:\n"
+        "        # (T, C) -> (C, T)\n"
+        "        audio = torch.from_numpy(audio_np.T)\n"
+    )
+
+    if "audio, sr = torchaudio.load(ref_audio)" not in text:
+        print("[patch_utils_infer] No torchaudio.load() found in utils_infer.py (already patched?).")
+        return
+
+    text = text.replace(old_snippet, new_snippet)
+    utils_file.write_text(text)
+    print("[patch_utils_infer] ✓ Patched utils_infer.py to use SciPy audio loading.")
+
+
+# Apply patch BEFORE importing F5TTS
+patch_utils_infer()
+
+from f5_tts.api import F5TTS  # noqa: E402  (import after patch)
 
 
 # -------------------------
@@ -17,9 +116,6 @@ _f5tts_model: Optional[F5TTS] = None
 def get_model() -> F5TTS:
     """
     Lazily initialize F5TTS v1 Base and keep it in memory for warm workers.
-    This uses the official F5TTS API class and loads:
-      - config:  configs/F5TTS_v1_Base.yaml
-      - ckpt:    hf://SWivid/F5-TTS/F5TTS_v1_Base/model_1250000.safetensors
     """
     global _f5tts_model
     if _f5tts_model is None:
@@ -86,7 +182,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     {
       "audio_base64": "<base64 wav>",
       "sample_rate": 24000,
-      "ref_text_used": "transcribed or provided text"
+      "ref_text_used": "some text"
     }
     """
     inp: Dict[str, Any] = job.get("input") or {}
@@ -100,22 +196,18 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"Failed to load reference audio: {e}"}
 
-    ref_text: str = inp.get("ref_text") or ""
+    # IMPORTANT:
+    # We DO NOT call api.transcribe() here to avoid hitting Whisper + torchcodec.
+    # Instead, we always provide a non-empty ref_text so F5-TTS never tries to
+    # do its own ASR inside preprocess_ref_audio_text().
+    ref_text = inp.get("ref_text")
+    if not ref_text or not str(ref_text).strip():
+        ref_text = "This is the reference audio."
 
     remove_silence: bool = bool(inp.get("remove_silence", False))
     speed: float = float(inp.get("speed", 1.0))
 
     api = get_model()
-
-    # If no ref_text is provided, use the built-in ASR (Whisper) to transcribe
-    if not ref_text:
-        try:
-            segments = api.transcribe(ref_path)  # returns list of { "text": ... }
-            ref_text = " ".join(seg.get("text", "") for seg in segments).strip()
-        except Exception as e:
-            # If transcription fails, still try inference with empty ref_text
-            ref_text = ""
-            print(f"[WARN] Transcription failed: {e}")
 
     # Prepare output wav path
     fd, out_path = tempfile.mkstemp(suffix=".wav")
