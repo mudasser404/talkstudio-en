@@ -1,0 +1,28 @@
+{
+  "input": {
+    "_comment": "=== F5-TTS Multilingual RunPod API - Complete Parameters ===",
+    "_supported_languages": ["English", "German", "Polish"],
+    "_model": "Gregniuki/F5-tts_English_German_Polish (multi3/model_1100000.pt)",
+
+    "text": "Hello, this is a test of the F5 TTS multilingual model. It supports English, German, and Polish languages.",
+
+    "_section_reference_audio": "=== Reference Audio (for voice cloning) ===",
+    "ref_audio_base64": null,
+    "ref_audio_url": "https://talkstudio.ai/media/library_voices/70eba4c2-d75e-48d3-aaed-f279403c87c7.mp3",
+    "ref_text": "",
+
+    "_section_generation_controls": "=== Generation Controls ===",
+    "speed": 1.0,
+    "seed": -1,
+    "nfe_step": 32,
+    "cfg_strength": 2.0,
+    "sway_sampling_coef": -1.0,
+    "target_rms": 0.1,
+    "cross_fade_duration": 0.15,
+    "fix_duration": null,
+    "remove_silence": false,
+
+    "_section_output": "=== Output Controls ===",
+    "output_format": "wav"
+  }
+}

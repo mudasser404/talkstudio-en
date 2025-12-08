@@ -139,11 +139,28 @@ def generate_speech(job):
         elif ref_audio_url:
             # Download audio from URL
             print(f"Downloading audio from {ref_audio_url}...")
-            response = requests.get(ref_audio_url)
+            response = requests.get(ref_audio_url, timeout=30)
             response.raise_for_status()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+
+            # Determine file extension
+            import os
+            url_ext = os.path.splitext(ref_audio_url)[1].lower()
+
+            # Save to temp file with original extension
+            with tempfile.NamedTemporaryFile(delete=False, suffix=url_ext or ".wav") as temp_audio:
                 temp_audio.write(response.content)
-                ref_audio_path = temp_audio.name
+                temp_download = temp_audio.name
+
+            # Convert to WAV if not already WAV
+            if url_ext not in ['.wav', '.wave']:
+                print(f"Converting {url_ext} to WAV...")
+                audio, sr = torchaudio.load(temp_download)
+                wav_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+                torchaudio.save(wav_path, audio, sr)
+                ref_audio_path = wav_path
+                os.unlink(temp_download)  # Clean up temp download
+            else:
+                ref_audio_path = temp_download
 
         # Preprocess reference audio
         ref_audio, ref_text = preprocess_ref_audio_text(
