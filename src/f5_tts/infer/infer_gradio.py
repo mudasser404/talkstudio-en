@@ -816,7 +816,7 @@ Have a conversation with an AI using your reference voice!
                         lines=2,
                     )
 
-        chatbot_interface = gr.Chatbot(label="Conversation", type="messages")
+        chatbot_interface = gr.Chatbot(label="Conversation", type="messages", allow_tags=True)
 
         with gr.Row():
             with gr.Column():
