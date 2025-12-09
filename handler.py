@@ -329,25 +329,23 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
             headers["X-API-Key"] = api_key
 
         # Prepare multipart form data with request_id and file
-        files = {
-            'file': (filename, open(file_path, 'rb'), 'audio/wav')
-        }
-        data = {
-            'request_id': request_id
-        }
-
         print(f"[HTTP_UPLOAD] Uploading as multipart/form-data...")
 
-        response = requests.post(
-            upload_url,
-            files=files,
-            data=data,
-            headers=headers,
-            timeout=300
-        )
+        with open(file_path, 'rb') as audio_file:
+            files = {
+                'file': (filename, audio_file, 'audio/wav')
+            }
+            data = {
+                'request_id': request_id
+            }
 
-        # Close file
-        files['file'][1].close()
+            response = requests.post(
+                upload_url,
+                files=files,
+                data=data,
+                headers=headers,
+                timeout=300
+            )
 
         print(f"[HTTP_UPLOAD] Response status: {response.status_code}")
         print(f"[HTTP_UPLOAD] Response headers: {dict(response.headers)}")
