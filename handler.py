@@ -387,19 +387,69 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
 # ==============================
 # HTTP Chunked Upload (for large files > nginx limit)
 # ==============================
+def _upload_single_chunk(args: tuple) -> Dict[str, Any]:
+    """
+    Upload a single chunk - helper for parallel uploads.
+    Returns dict with chunk_index, success status, and response data.
+    """
+    chunk_index, chunk_data, upload_url, headers, _ = args  # _ = total_chunks (in headers)
+
+    try:
+        chunk_headers = headers.copy()
+        chunk_headers["X-Chunk-Index"] = str(chunk_index)
+
+        response = requests.post(
+            upload_url,
+            data=chunk_data,
+            headers=chunk_headers,
+            timeout=120
+        )
+
+        if response.status_code != 200:
+            return {
+                "chunk_index": chunk_index,
+                "success": False,
+                "error": f"Status {response.status_code}: {response.text[:200]}"
+            }
+
+        # Try to parse response for URL
+        audio_url = None
+        try:
+            result = response.json()
+            audio_url = result.get("url") or result.get("file_url") or result.get("audio_url")
+        except:
+            pass
+
+        return {
+            "chunk_index": chunk_index,
+            "success": True,
+            "audio_url": audio_url
+        }
+
+    except Exception as e:
+        return {
+            "chunk_index": chunk_index,
+            "success": False,
+            "error": str(e)
+        }
+
+
 def _upload_to_http_chunked(file_path: str, storage_config: Dict[str, Any]) -> str:
     """
     Upload file in chunks to bypass nginx size limits.
+    Uses BATCH/PARALLEL uploads (10 chunks at a time) for faster upload.
     Each chunk is ~500KB which is under nginx's 1MB default limit.
     Server must support chunked uploads with X-Chunk-Index headers.
     """
     import uuid
     from datetime import datetime
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     upload_endpoint = storage_config.get("upload_endpoint")
     api_key = storage_config.get("api_key")
     request_id = storage_config.get("request_id")
     chunk_size = int(storage_config.get("chunk_size", 512000))  # 500KB default
+    batch_size = int(storage_config.get("batch_size", 10))  # 10 chunks at a time
 
     if not upload_endpoint:
         raise ValueError("Storage config must include upload_endpoint")
@@ -418,63 +468,74 @@ def _upload_to_http_chunked(file_path: str, storage_config: Dict[str, Any]) -> s
         filename = f"runpod_{timestamp}_{request_id[:8]}.wav"
 
         print(f"[HTTP_CHUNKED] Uploading {file_size_mb:.2f}MB in {total_chunks} chunks")
+        print(f"[HTTP_CHUNKED] Using BATCH upload: {batch_size} chunks in parallel")
         print(f"[HTTP_CHUNKED] Request ID: {request_id}")
         print(f"[HTTP_CHUNKED] Chunk size: {chunk_size / 1024:.0f}KB")
         print(f"[HTTP_CHUNKED] Endpoint: {upload_endpoint}")
 
-        audio_url = None
+        # Add request_id to URL parameter
+        upload_url = f"{upload_endpoint}?request_id={request_id}"
 
+        # Setup base headers
+        base_headers = {
+            "X-Request-Id": request_id,
+            "X-Filename": filename,
+            "X-Total-Chunks": str(total_chunks),
+            "Content-Type": "application/octet-stream"
+        }
+        if api_key:
+            base_headers["X-API-Key"] = api_key
+
+        audio_url = None
+        uploaded_count = 0
+
+        # Read all chunks into memory for parallel upload
+        all_chunks = []
         with open(file_path, 'rb') as f:
             for chunk_index in range(total_chunks):
                 chunk_data = f.read(chunk_size)
-                chunk_size_kb = len(chunk_data) / 1024
+                all_chunks.append((chunk_index, chunk_data))
 
-                # Add request_id to URL parameter
-                upload_url = f"{upload_endpoint}?request_id={request_id}"
+        # Upload in batches
+        for batch_start in range(0, total_chunks, batch_size):
+            batch_end = min(batch_start + batch_size, total_chunks)
+            batch_chunks = all_chunks[batch_start:batch_end]
 
-                # Setup headers
-                headers = {
-                    "X-Request-Id": request_id,
-                    "X-Filename": filename,
-                    "X-Chunk-Index": str(chunk_index),
-                    "X-Total-Chunks": str(total_chunks),
-                    "Content-Type": "application/octet-stream"
-                }
-                if api_key:
-                    headers["X-API-Key"] = api_key
+            print(f"[HTTP_CHUNKED] Uploading batch: chunks {batch_start + 1}-{batch_end} of {total_chunks}")
 
-                print(f"[HTTP_CHUNKED] Uploading chunk {chunk_index + 1}/{total_chunks} ({chunk_size_kb:.0f}KB)...")
+            # Prepare args for parallel upload
+            upload_args = [
+                (chunk_index, chunk_data, upload_url, base_headers, total_chunks)
+                for chunk_index, chunk_data in batch_chunks
+            ]
 
-                response = requests.post(
-                    upload_url,
-                    data=chunk_data,
-                    headers=headers,
-                    timeout=120
-                )
+            # Upload batch in parallel
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                futures = {executor.submit(_upload_single_chunk, args): args[0] for args in upload_args}
 
-                if response.status_code != 200:
-                    error_body = response.text[:500]
-                    print(f"[HTTP_CHUNKED] Chunk {chunk_index + 1} failed: {error_body}")
-                    raise Exception(
-                        f"Chunk {chunk_index + 1} upload failed with status {response.status_code}. "
-                        f"Server response: {error_body}"
-                    )
+                for future in as_completed(futures):
+                    result = future.result()
+                    chunk_idx = result["chunk_index"]
 
-                # Try to parse response
-                try:
-                    result = response.json()
-                    print(f"[HTTP_CHUNKED] Chunk {chunk_index + 1} response: {result}")
+                    if not result["success"]:
+                        error_msg = result.get("error", "Unknown error")
+                        print(f"[HTTP_CHUNKED] Chunk {chunk_idx + 1} failed: {error_msg}")
+                        raise Exception(f"Chunk {chunk_idx + 1} upload failed: {error_msg}")
 
-                    # Check if this was the last chunk and we got the final URL
-                    if result.get("url") or result.get("file_url") or result.get("audio_url"):
-                        audio_url = result.get("url") or result.get("file_url") or result.get("audio_url")
-                except:
-                    # Non-JSON response
-                    print(f"[HTTP_CHUNKED] Chunk {chunk_index + 1} uploaded successfully")
+                    uploaded_count += 1
 
-                # Progress update
-                progress = ((chunk_index + 1) / total_chunks) * 100
-                print(f"[HTTP_CHUNKED] Progress: {progress:.1f}%")
+                    # Check for URL in response (usually on last chunk)
+                    if result.get("audio_url"):
+                        audio_url = result["audio_url"]
+
+            # Batch progress update
+            progress = (batch_end / total_chunks) * 100
+            print(f"[HTTP_CHUNKED] Progress: {progress:.1f}% ({batch_end}/{total_chunks} chunks uploaded)")
+
+        # Clear chunks from memory
+        del all_chunks
+
+        print(f"[HTTP_CHUNKED] ✓ All {uploaded_count} chunks uploaded successfully")
 
         if not audio_url:
             # If server didn't return URL in chunks, make final request to get it
