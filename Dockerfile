@@ -20,9 +20,9 @@ WORKDIR /workspace
 RUN git clone https://github.com/SWivid/F5-TTS.git \
  && cd F5-TTS \
  && pip install --upgrade pip \
- # Editable install of official F5-TTS (works with torch==2.4.0 in base image)
+ # Editable install of official F5-TTS (works with torch==2.4.0 from base image)
  && pip install -e . --no-cache-dir \
- # Extra deps we need
+ # Extra deps we need: SciPy, RunPod SDK, HTTP client, and faster-whisper
  && pip install scipy requests runpod faster-whisper --no-cache-dir
 
 # Hugging Face cache directory
