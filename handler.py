@@ -676,13 +676,14 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     file_size_mb = file_size / (1024 * 1024)
     print(f"[FINAL] Complete audio ready: {file_size_mb:.2f}MB")
 
-    # Storage config - create default if not provided
+    # Storage config - get from input
     storage_config = inp.get("storage")
     auto_upload_threshold_mb = float(inp.get("auto_upload_threshold_mb", 8.0))
     request_id = inp.get("request_id")  # Get request_id from input if provided
+    enable_auto_upload = inp.get("enable_auto_upload", False)  # Disabled by default
 
-    # Auto-upload for large files
-    if not storage_config and file_size_mb > auto_upload_threshold_mb:
+    # Auto-upload for large files (only if explicitly enabled)
+    if enable_auto_upload and not storage_config and file_size_mb > auto_upload_threshold_mb:
         print(f"[AUTO-CONFIG] File is {file_size_mb:.2f}MB, creating default HTTP upload config")
         storage_config = {
             "method": "http",
@@ -692,6 +693,8 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         if request_id:
             storage_config["request_id"] = request_id
             print(f"[AUTO-CONFIG] Using provided request_id: {request_id}")
+        else:
+            print(f"[AUTO-CONFIG] WARNING: Auto-upload enabled but no request_id provided!")
 
     # If storage config exists but no request_id in it, add from input
     if storage_config and request_id and "request_id" not in storage_config:
@@ -710,23 +713,23 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     try:
-        # Upload if storage config provided OR file too large
+        # Upload only if storage config is explicitly provided
         should_upload = storage_config is not None
 
-        if should_upload and file_size_mb > auto_upload_threshold_mb:
+        if should_upload:
             print(f"[OUTPUT] Uploading COMPLETE audio file to VPS...")
-            
+
             audio_url = _upload_to_storage(final_path, storage_config)
             result["audio_url"] = audio_url
             result["uploaded"] = True
-            
+
             if file_size_mb > auto_upload_threshold_mb:
                 result["upload_reason"] = f"file_size_exceeds_{auto_upload_threshold_mb}mb"
             else:
                 result["upload_reason"] = "storage_config_provided"
-            
+
             print(f"[OUTPUT] ✓ Complete audio available at: {audio_url}")
-            
+
         else:
             # Base64 for small files
             # TEMPORARY: Increased to 80MB while upload endpoint is being fixed
