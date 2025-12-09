@@ -1,11 +1,14 @@
 import base64
 import os
+import re
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+import numpy as np
 import requests
 import runpod
+from scipy.io import wavfile
 
 
 # ==============================
@@ -87,15 +90,12 @@ def get_f5tts_model() -> F5TTS:
 
 def get_asr_model() -> WhisperModel:
     """
-    Lazily init faster-whisper.
-
-    For 'best' quality, you can use:
-      - model_name = "large-v3"  (heavier, best quality)
-    If you want faster/cheaper, change to "medium.en" or "small.en".
+    High-quality ASR for reference audio.
+    Uses Whisper large-v3 via faster-whisper.
     """
     global _asr_model
     if _asr_model is None:
-        model_name = "large-v3"  # change to "medium.en" if VRAM is tight
+        model_name = "large-v3"  # best quality; change to "medium.en" if VRAM is tight
         device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
 
@@ -109,7 +109,7 @@ def get_asr_model() -> WhisperModel:
 
 
 # ==============================
-# Helpers
+# Helpers: file handling
 # ==============================
 def _save_b64_to_temp(b64_str: str, suffix: str = ".wav") -> str:
     audio_bytes = base64.b64decode(b64_str)
@@ -140,9 +140,13 @@ def _get_ref_audio_path(inp: Dict[str, Any]) -> str:
     raise ValueError("Provide either 'ref_audio_base64' or 'ref_audio_url' in input.")
 
 
+# ==============================
+# Helpers: ASR (transcriber)
+# ==============================
 def _transcribe_ref_audio(ref_path: str, language: Optional[str] = None) -> str:
     """
-    Use faster-whisper to get the transcript of the reference audio.
+    Use faster-whisper (large-v3) to get transcript of the reference audio.
+    This runs ONCE per job and is reused for all chunks.
     """
     model = get_asr_model()
     segments, info = model.transcribe(
@@ -157,6 +161,118 @@ def _transcribe_ref_audio(ref_path: str, language: Optional[str] = None) -> str:
 
 
 # ==============================
+# Helpers: text chunking for long YouTube scripts
+# ==============================
+def _split_into_sentences(text: str) -> List[str]:
+    # Very simple sentence splitter based on punctuation.
+    # Good enough for YouTube scripts; avoids extra deps.
+    text = text.strip()
+    if not text:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def _chunk_text(
+    text: str,
+    max_chars: int = 400,
+    min_chars: int = 150,
+) -> List[str]:
+    """
+    Split long text into chunks around sentence boundaries.
+
+    max_chars ~ how long each chunk should be (roughly).
+    min_chars ~ don't create very tiny chunks unless unavoidable.
+    """
+    sentences = _split_into_sentences(text)
+    if not sentences:
+        return [text.strip()] if text.strip() else []
+
+    chunks: List[str] = []
+    current = ""
+
+    for s in sentences:
+        if not current:
+            current = s
+            continue
+
+        # If adding this sentence keeps us under max_chars, keep accumulating
+        if len(current) + 1 + len(s) <= max_chars:
+            current = current + " " + s
+        else:
+            # If current is big enough, push it as a chunk
+            if len(current) >= min_chars:
+                chunks.append(current)
+                current = s
+            else:
+                # current too short, force-join and then flush
+                current = current + " " + s
+                chunks.append(current)
+                current = ""
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    # Fallback: if somehow nothing, just return original text
+    return chunks or [text.strip()]
+
+
+# ==============================
+# Helpers: TTS per chunk
+# ==============================
+def _tts_chunk(
+    api: F5TTS,
+    ref_path: str,
+    ref_text: str,
+    gen_text: str,
+    speed: float,
+    remove_silence: bool,
+) -> np.ndarray:
+    """
+    Run F5TTS on a single text chunk and return it as a numpy array.
+    """
+    fd, out_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+
+    try:
+        _wav, sr, _ = api.infer(
+            ref_file=ref_path,
+            ref_text=ref_text,
+            gen_text=gen_text,
+            speed=speed,
+            remove_silence=remove_silence,
+            file_wave=out_path,
+            file_spec=None,
+        )
+        sr_read, audio_np = wavfile.read(out_path)
+        assert sr_read == sr, "Sample rate mismatch between infer() and file"
+        return audio_np.astype(np.int16)  # assume 16-bit WAV
+    finally:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+
+
+def _concat_audio(segments: List[np.ndarray]) -> np.ndarray:
+    """
+    Concatenate multiple audio segments along time axis.
+    Assumes all have same sample rate and channels.
+    """
+    if not segments:
+        return np.zeros(0, dtype=np.int16)
+
+    # Ensure all shapes are compatible (1D or (T, C))
+    base = segments[0]
+    if base.ndim == 1:
+        return np.concatenate(segments, axis=0)
+
+    # multi-channel: assume (T, C)
+    return np.concatenate(segments, axis=0)
+
+
+# ==============================
 # Main RunPod job handler
 # ==============================
 def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -165,29 +281,40 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
     {
       "input": {
-        "text": "Target text you want to speak.",
-        "ref_audio_url": "https://...wav",      // or "ref_audio_base64"
+        "text": "Very long YouTube script here...",
+        "ref_audio_url": "https://...wav",         // or "ref_audio_base64"
         "ref_audio_base64": "...",
-        "ref_text": "",                         // optional; if empty we'll transcribe
-        "language": "en",                       // optional hint for ASR
-        "remove_silence": true,
-        "speed": 1.0
+        "ref_text": "",                            // optional; if empty, we'll transcribe
+        "language": "en",                          // optional hint for ASR
+        "remove_silence": true,                    // optional, default: false
+        "speed": 0.7,                              // optional, default: 0.7 (slower, YouTube-friendly)
+        "chunk_max_chars": 400,                    // optional
+        "chunk_min_chars": 150                     // optional
       }
+    }
+
+    Response:
+
+    {
+      "audio_base64": "<base64 wav of ALL chunks>",
+      "sample_rate": 24000,
+      "ref_text_used": "transcribed or provided text",
+      "num_chunks": 42
     }
     """
     inp: Dict[str, Any] = job.get("input") or {}
 
-    text = inp.get("text")
+    text = (inp.get("text") or "").strip()
     if not text:
         return {"error": "Missing 'text' in input."}
 
-    # 1) Reference audio
+    # ---- 1) Reference audio ----
     try:
         ref_path = _get_ref_audio_path(inp)
     except Exception as e:
         return {"error": f"Failed to load reference audio: {e}"}
 
-    # 2) ref_text: either provided by client, or via ASR
+    # ---- 2) ref_text: use client-provided or ASR transcript ----
     ref_text = (inp.get("ref_text") or "").strip()
     language_hint = inp.get("language")  # e.g. "en"
 
@@ -195,7 +322,6 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             ref_text = _transcribe_ref_audio(ref_path, language=language_hint)
         except Exception as e:
-            # ASR failed – better to be explicit than silently degrade quality
             return {"error": f"ASR transcription failed: {e}"}
 
     if not ref_text:
@@ -203,36 +329,71 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             "error": "ASR produced empty transcript. Please provide 'ref_text' manually."
         }
 
+    # ---- 3) Chunking parameters ----
+    max_chars = int(inp.get("chunk_max_chars", 400))
+    min_chars = int(inp.get("chunk_min_chars", 150))
+    chunks = _chunk_text(text, max_chars=max_chars, min_chars=min_chars)
+    print(f"[chunking] text length={len(text)}, num_chunks={len(chunks)}")
+
+    # ---- 4) Synthesis settings ----
+    # Default 0.7 is slower and more natural for YouTube narration.
+    speed: float = float(inp.get("speed", 0.7))
     remove_silence: bool = bool(inp.get("remove_silence", False))
-    speed: float = float(inp.get("speed", 1.0))
 
     api = get_f5tts_model()
 
-    # 3) Output file
-    fd, out_path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
+    # ---- 5) Run TTS per chunk and concatenate ----
+    all_segments: List[np.ndarray] = []
+    sr_final: Optional[int] = None
 
     try:
-        # 4) Run F5-TTS inference
-        wav, sr, _ = api.infer(
-            ref_file=ref_path,
-            ref_text=ref_text,
-            gen_text=text,
-            speed=speed,
-            remove_silence=remove_silence,
-            file_wave=out_path,
-            file_spec=None,
-        )
+        for idx, chunk_text in enumerate(chunks, start=1):
+            print(f"[TTS] Generating chunk {idx}/{len(chunks)}: {len(chunk_text)} chars")
+            audio_np = _tts_chunk(
+                api=api,
+                ref_path=ref_path,
+                ref_text=ref_text,
+                gen_text=chunk_text,
+                speed=speed,
+                remove_silence=remove_silence,
+            )
 
-        # 5) Encode result
-        with open(out_path, "rb") as f:
-            audio_bytes = f.read()
-        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+            if audio_np.size == 0:
+                continue
+
+            # sample rate from first segment
+            if sr_final is None:
+                # We know F5TTS_v1_Base uses 24kHz, but we can read from API config if needed.
+                sr_final = 24000
+
+            all_segments.append(audio_np)
+
+        if not all_segments:
+            return {"error": "No audio was generated for any chunk."}
+
+        final_audio = _concat_audio(all_segments)
+
+        # ---- 6) Write final WAV and base64-encode ----
+        fd, final_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+
+        try:
+            wavfile.write(final_path, sr_final, final_audio)
+            with open(final_path, "rb") as f:
+                audio_bytes = f.read()
+            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        finally:
+            try:
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+            except Exception:
+                pass
 
         return {
             "audio_base64": audio_b64,
-            "sample_rate": sr,
+            "sample_rate": sr_final,
             "ref_text_used": ref_text,
+            "num_chunks": len(chunks),
         }
 
     except Exception as e:
@@ -245,11 +406,8 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-        try:
-            if os.path.exists(out_path):
-                os.remove(out_path)
-        except Exception:
-            pass
 
-
+# ==============================
+# RunPod serverless entry
+# ==============================
 runpod.serverless.start({"handler": generate_speech})
