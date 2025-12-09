@@ -292,7 +292,7 @@ def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> 
 # ==============================
 def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]) -> str:
     """
-    Upload COMPLETE file via HTTP POST with streaming
+    Upload COMPLETE file via HTTP POST with multipart/form-data
     """
     import uuid
     from datetime import datetime
@@ -307,45 +307,47 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
         file_size = os.path.getsize(file_path)
         file_size_mb = file_size / (1024 * 1024)
 
-        # Generate unique filename
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        unique_id = str(uuid.uuid4())[:8]
-        filename = f"runpod_{timestamp}_{unique_id}.wav"
+        filename = f"runpod_{timestamp}_{request_id[:8]}.wav"
 
         print(f"[HTTP_UPLOAD] Uploading COMPLETE audio: {file_size_mb:.2f}MB")
+        print(f"[HTTP_UPLOAD] Request ID: {request_id}")
         print(f"[HTTP_UPLOAD] Filename: {filename}")
         print(f"[HTTP_UPLOAD] Endpoint: {upload_endpoint}")
 
+        # Add request_id to URL parameter
+        upload_url = f"{upload_endpoint}?request_id={request_id}"
+
+        # Setup headers with request_id
         headers = {
-            "Content-Type": "audio/wav",
-            "X-Filename": filename  # Send filename in header
+            "X-Request-Id": request_id,
+            "X-Filename": filename
         }
         if api_key:
             headers["X-API-Key"] = api_key
 
-        # Stream upload
-        def file_generator():
-            CHUNK_SIZE = 65536  # 64KB
-            uploaded = 0
-            with open(file_path, 'rb') as f:
-                while True:
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    uploaded += len(chunk)
+        # Prepare multipart form data with request_id and file
+        files = {
+            'file': (filename, open(file_path, 'rb'), 'audio/wav')
+        }
+        data = {
+            'request_id': request_id
+        }
 
-                    if uploaded % (5 * 1024 * 1024) < CHUNK_SIZE:
-                        progress = (uploaded / file_size) * 100
-                        print(f"[HTTP_UPLOAD] Progress: {progress:.1f}%")
-
-                    yield chunk
+        print(f"[HTTP_UPLOAD] Uploading as multipart/form-data...")
 
         response = requests.post(
-            upload_endpoint,
-            data=file_generator(),
+            upload_url,
+            files=files,
+            data=data,
             headers=headers,
             timeout=300
         )
+
+        # Close file
+        files['file'][1].close()
 
         print(f"[HTTP_UPLOAD] Response status: {response.status_code}")
         print(f"[HTTP_UPLOAD] Response headers: {dict(response.headers)}")
@@ -676,7 +678,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     storage_config = inp.get("storage")
     auto_upload_threshold_mb = float(inp.get("auto_upload_threshold_mb", 8.0))
 
-    # If no storage config but file will likely be large, create default config
+    # Auto-upload for large files
     if not storage_config and file_size_mb > auto_upload_threshold_mb:
         print(f"[AUTO-CONFIG] File is {file_size_mb:.2f}MB, creating default HTTP upload config")
         storage_config = {
