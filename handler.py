@@ -8,46 +8,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import requests
 import runpod
-import torch  # <-- NEW: for CUDA debug
+import torch
 from scipy.io import wavfile
-
-
-# ==============================
-# Debug: CUDA / Environment
-# ==============================
-def _debug_cuda_env() -> None:
-    """
-    Print CUDA-related information so we can see what the container actually sees.
-    """
-    print("========== CUDA / ENV DEBUG ==========")
-    try:
-        print("[DEBUG] torch.__version__:", torch.__version__)
-    except Exception as e:
-        print("[DEBUG] torch.__version__ error:", e)
-
-    try:
-        print("[DEBUG] torch.cuda.is_available():", torch.cuda.is_available())
-    except Exception as e:
-        print("[DEBUG] torch.cuda.is_available() error:", e)
-
-    try:
-        count = torch.cuda.device_count()
-        print("[DEBUG] torch.cuda.device_count():", count)
-        for idx in range(count):
-            try:
-                print(f"[DEBUG] torch.cuda.get_device_name({idx}):", torch.cuda.get_device_name(idx))
-            except Exception as e_name:
-                print(f"[DEBUG] get_device_name({idx}) error:", e_name)
-    except Exception as e:
-        print("[DEBUG] torch.cuda.device_count() error:", e)
-
-    print("[DEBUG] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
-    print("[DEBUG] NVIDIA_VISIBLE_DEVICES:", os.environ.get("NVIDIA_VISIBLE_DEVICES"))
-    print("======== END CUDA / ENV DEBUG ========")
-
-
-# Run debug once at import time
-_debug_cuda_env()
 
 
 # ==============================
@@ -117,6 +79,9 @@ _asr_model: Optional[WhisperModel] = None
 
 
 def get_f5tts_model() -> F5TTS:
+    """
+    Load F5TTS_v1_Base once and reuse.
+    """
     global _f5tts_model
     if _f5tts_model is None:
         print("========== INIT F5TTS MODEL ==========")
@@ -135,6 +100,7 @@ def get_asr_model() -> WhisperModel:
     """
     High-quality ASR for reference audio.
     Uses Whisper large-v3 via faster-whisper.
+    Prefer GPU (cuda) when available.
     """
     global _asr_model
     if _asr_model is None:
@@ -145,18 +111,12 @@ def get_asr_model() -> WhisperModel:
         print("[ASR] torch.cuda.is_available():", torch.cuda.is_available())
         print("[ASR] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
 
-        # Prefer actual CUDA detection over just env var
         if torch.cuda.is_available():
             device = "cuda"
             compute_type = "float16"
         else:
-            # Fallback to env-based check (as in your original code)
-            if os.environ.get("CUDA_VISIBLE_DEVICES"):
-                device = "cuda"
-                compute_type = "float16"
-            else:
-                device = "cpu"
-                compute_type = "int8"
+            device = "cpu"
+            compute_type = "int8"
 
         print(f"[ASR] Selected device={device}, compute_type={compute_type}")
 
@@ -226,11 +186,24 @@ def _transcribe_ref_audio(ref_path: str, language: Optional[str] = None) -> str:
 
 
 # ==============================
-# Helpers: text chunking for long YouTube scripts
+# Helpers: text normalization + chunking
 # ==============================
+def _clean_for_tts(text: str) -> str:
+    """
+    Normalize text before sending to F5TTS:
+      - remove parentheses and their contents
+      - collapse whitespace
+    This avoids some edge cases with punctuation.
+    """
+    # remove (...) blocks
+    text = re.sub(r"\([^)]*\)", "", text)
+    # collapse multiple spaces/newlines
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def _split_into_sentences(text: str) -> List[str]:
     # Very simple sentence splitter based on punctuation.
-    # Good enough for YouTube scripts; avoids extra deps.
     text = text.strip()
     if not text:
         return []
@@ -240,8 +213,8 @@ def _split_into_sentences(text: str) -> List[str]:
 
 def _chunk_text(
     text: str,
-    max_chars: int = 400,
-    min_chars: int = 150,
+    max_chars: int = 200,   # smaller default for stability
+    min_chars: int = 80,
 ) -> List[str]:
     """
     Split long text into chunks around sentence boundaries.
@@ -292,6 +265,8 @@ def _tts_chunk(
     gen_text: str,
     speed: float,
     remove_silence: bool,
+    nfe_step: int,
+    target_rms: float,
 ) -> np.ndarray:
     """
     Run F5TTS on a single text chunk and return it as a numpy array.
@@ -306,6 +281,8 @@ def _tts_chunk(
             gen_text=gen_text,
             speed=speed,
             remove_silence=remove_silence,
+            nfe_step=nfe_step,        # quality (32/64 steps)
+            target_rms=target_rms,    # volume
             file_wave=out_path,
             file_spec=None,
         )
@@ -328,7 +305,6 @@ def _concat_audio(segments: List[np.ndarray]) -> np.ndarray:
     if not segments:
         return np.zeros(0, dtype=np.int16)
 
-    # Ensure all shapes are compatible (1D or (T, C))
     base = segments[0]
     if base.ndim == 1:
         return np.concatenate(segments, axis=0)
@@ -341,29 +317,46 @@ def _concat_audio(segments: List[np.ndarray]) -> np.ndarray:
 # Main RunPod job handler
 # ==============================
 def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
-    print("##### BUILD VERSION: 2025-12-09-handler-real-01 #####")
+    """
+    Request:
+
+    {
+      "input": {
+        "text": "Very long YouTube script here...",
+        "ref_audio_url": "https://...wav",         // or "ref_audio_base64"
+        "ref_audio_base64": "...",
+        "ref_text": "",                            // optional; if empty, we'll transcribe
+        "language": "en",                          // optional hint for ASR
+        "remove_silence": true,                    // optional, default: false
+        "speed": 0.7,                              // optional, default: 0.7 (slower, YouTube-friendly)
+        "chunk_max_chars": 200,                    // optional
+        "chunk_min_chars": 80,                     // optional
+        "quality": "standard" | "premium",         // optional, affects nfe_step
+        "volume": 1.0,                             // optional, 0.0–2.0
+        "pause_s": 0.12                            // optional, seconds of silence between chunks
+      }
+    }
+    """
+    print("### handler version: f5tts_youtube_pauses_2025-12-09 ###")
 
     inp: Dict[str, Any] = job.get("input") or {}
 
-    text = (inp.get("text") or "").strip()
-    if not text:
-        print("[INPUT] Missing 'text' in input.")
+    raw_text = (inp.get("text") or "").strip()
+    if not raw_text:
         return {"error": "Missing 'text' in input."}
 
-    print(f"[INPUT] text length={len(text)}")
+    print("[INPUT] text length:", len(raw_text))
 
     # ---- 1) Reference audio ----
     try:
         ref_path = _get_ref_audio_path(inp)
         print("[REF] Loaded reference audio:", ref_path)
     except Exception as e:
-        print("[ERROR] Failed to load reference audio:", e)
         return {"error": f"Failed to load reference audio: {e}"}
 
     # ---- 2) ref_text: use client-provided or ASR transcript ----
     ref_text = (inp.get("ref_text") or "").strip()
     language_hint = inp.get("language")  # e.g. "en"
-    print("[REF] language_hint:", language_hint)
 
     if ref_text:
         print(f"[REF] Using provided ref_text (len={len(ref_text)}): '{ref_text[:80]}'")
@@ -372,7 +365,6 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             ref_text = _transcribe_ref_audio(ref_path, language=language_hint)
         except Exception as e:
-            print("[ERROR] ASR transcription failed:", e)
             return {"error": f"ASR transcription failed: {e}"}
 
     if not ref_text:
@@ -382,18 +374,39 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # ---- 3) Chunking parameters ----
-    max_chars = int(inp.get("chunk_max_chars", 400))
-    min_chars = int(inp.get("chunk_min_chars", 150))
-    chunks = _chunk_text(text, max_chars=max_chars, min_chars=min_chars)
+    max_chars = int(inp.get("chunk_max_chars", 200))
+    min_chars = int(inp.get("chunk_min_chars", 80))
+    chunks = _chunk_text(raw_text, max_chars=max_chars, min_chars=min_chars)
     print(
-        f"[chunking] text length={len(text)}, num_chunks={len(chunks)}, "
+        f"[chunking] text length={len(raw_text)}, num_chunks={len(chunks)}, "
         f"max_chars={max_chars}, min_chars={min_chars}"
     )
 
     # ---- 4) Synthesis settings ----
     speed: float = float(inp.get("speed", 0.7))  # slower default
     remove_silence: bool = bool(inp.get("remove_silence", False))
-    print(f"[SYNTH] speed={speed}, remove_silence={remove_silence}")
+
+    # Generation quality: "standard" (32) vs "premium" (64)
+    quality = (inp.get("quality") or "standard").lower()
+    if quality == "premium":
+        nfe_step = 64
+    else:
+        nfe_step = 32
+
+    # Volume: 0.0–2.0 → map linearly on top of default target_rms ≈ 0.1
+    volume = float(inp.get("volume", 1.0))
+    if volume < 0.0:
+        volume = 0.0
+    target_rms = 0.1 * volume
+
+    # Pause between chunks (seconds)
+    pause_seconds = float(inp.get("pause_s", 0.12))  # default 120ms
+
+    print(
+        f"[SYNTH] speed={speed}, remove_silence={remove_silence}, "
+        f"quality={quality}, nfe_step={nfe_step}, volume={volume}, "
+        f"target_rms={target_rms}, pause_s={pause_seconds}"
+    )
 
     api = get_f5tts_model()
 
@@ -403,26 +416,44 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         for idx, chunk_text in enumerate(chunks, start=1):
-            print(f"[TTS] Generating chunk {idx}/{len(chunks)}: {len(chunk_text)} chars")
-            audio_np = _tts_chunk(
-                api=api,
-                ref_path=ref_path,
-                ref_text=ref_text,
-                gen_text=chunk_text,
-                speed=speed,
-                remove_silence=remove_silence,
-            )
+            cleaned = _clean_for_tts(chunk_text)
+            if not cleaned:
+                print(f"[TTS] Chunk {idx} is empty after cleaning, skipping.")
+                continue
+
+            print(f"[TTS] Generating chunk {idx}/{len(chunks)}: {len(cleaned)} chars (cleaned)")
+            try:
+                audio_np = _tts_chunk(
+                    api=api,
+                    ref_path=ref_path,
+                    ref_text=ref_text,
+                    gen_text=cleaned,
+                    speed=speed,
+                    remove_silence=remove_silence,
+                    nfe_step=nfe_step,
+                    target_rms=target_rms,
+                )
+            except Exception as e:
+                print(f"[TTS] Error on chunk {idx}: {e}")
+                return {"error": f"TTS failed on chunk {idx}: {e}"}
 
             if audio_np.size == 0:
                 print(f"[TTS] Chunk {idx} produced empty audio, skipping.")
                 continue
 
-            # sample rate from first segment
             if sr_final is None:
                 sr_final = 24000  # F5TTS_v1_Base default
                 print(f"[TTS] Sample rate set to {sr_final}")
 
             all_segments.append(audio_np)
+
+            # ---- Pause between chunks ----
+            if idx < len(chunks) and pause_seconds > 0.0:
+                pause_samples = int(sr_final * pause_seconds)
+                if pause_samples > 0:
+                    print(f"[TTS] Inserting {pause_samples} samples of silence between chunk {idx} and {idx+1}")
+                    silence = np.zeros(pause_samples, dtype=np.int16)
+                    all_segments.append(silence)
 
         if not all_segments:
             print("[ERROR] No audio was generated for any chunk.")
@@ -456,6 +487,9 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             "sample_rate": sr_final,
             "ref_text_used": ref_text,
             "num_chunks": len(chunks),
+            "quality": quality,
+            "volume": volume,
+            "pause_s": pause_seconds,
         }
 
     except Exception as e:
