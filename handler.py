@@ -391,53 +391,80 @@ def _upload_single_chunk(args: tuple) -> Dict[str, Any]:
     """
     Upload a single chunk - helper for parallel uploads.
     Returns dict with chunk_index, success status, and response data.
+    Includes retry logic for rate limiting (Cloudflare 530, 429, etc.)
     """
-    chunk_index, chunk_data, upload_url, headers, _ = args  # _ = total_chunks (in headers)
+    import time
+    chunk_index, chunk_data, upload_url, headers, max_retries = args
 
-    try:
-        chunk_headers = headers.copy()
-        chunk_headers["X-Chunk-Index"] = str(chunk_index)
+    retry_delays = [0.5, 1, 2, 4]  # Exponential backoff
+    last_error = None
 
-        response = requests.post(
-            upload_url,
-            data=chunk_data,
-            headers=chunk_headers,
-            timeout=120
-        )
+    for attempt in range(max_retries + 1):
+        try:
+            chunk_headers = headers.copy()
+            chunk_headers["X-Chunk-Index"] = str(chunk_index)
 
-        if response.status_code != 200:
+            response = requests.post(
+                upload_url,
+                data=chunk_data,
+                headers=chunk_headers,
+                timeout=120
+            )
+
+            # Retry on rate limiting / Cloudflare errors
+            if response.status_code in [429, 503, 530, 520, 521, 522, 523, 524]:
+                last_error = f"Status {response.status_code}: Rate limited/Cloudflare"
+                if attempt < max_retries:
+                    delay = retry_delays[min(attempt, len(retry_delays) - 1)]
+                    time.sleep(delay)
+                    continue
+                else:
+                    return {
+                        "chunk_index": chunk_index,
+                        "success": False,
+                        "error": f"Status {response.status_code} after {max_retries} retries"
+                    }
+
+            if response.status_code != 200:
+                return {
+                    "chunk_index": chunk_index,
+                    "success": False,
+                    "error": f"Status {response.status_code}: {response.text[:200]}"
+                }
+
+            # Try to parse response for URL
+            audio_url = None
+            try:
+                result = response.json()
+                audio_url = result.get("url") or result.get("file_url") or result.get("audio_url")
+            except:
+                pass
+
             return {
                 "chunk_index": chunk_index,
-                "success": False,
-                "error": f"Status {response.status_code}: {response.text[:200]}"
+                "success": True,
+                "audio_url": audio_url
             }
 
-        # Try to parse response for URL
-        audio_url = None
-        try:
-            result = response.json()
-            audio_url = result.get("url") or result.get("file_url") or result.get("audio_url")
-        except:
-            pass
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_retries:
+                delay = retry_delays[min(attempt, len(retry_delays) - 1)]
+                time.sleep(delay)
+                continue
 
-        return {
-            "chunk_index": chunk_index,
-            "success": True,
-            "audio_url": audio_url
-        }
-
-    except Exception as e:
-        return {
-            "chunk_index": chunk_index,
-            "success": False,
-            "error": str(e)
-        }
+    return {
+        "chunk_index": chunk_index,
+        "success": False,
+        "error": last_error or "Unknown error"
+    }
 
 
 def _upload_to_http_chunked(file_path: str, storage_config: Dict[str, Any]) -> str:
     """
     Upload file in chunks to bypass nginx size limits.
-    Uses BATCH/PARALLEL uploads (10 chunks at a time) for faster upload.
+    Uses BATCH/PARALLEL uploads (3 chunks at a time by default) for faster upload.
+    Reduced from 10 to 3 to avoid Cloudflare rate limiting (530 errors).
     Each chunk is ~500KB which is under nginx's 1MB default limit.
     Server must support chunked uploads with X-Chunk-Index headers.
     """
@@ -449,7 +476,8 @@ def _upload_to_http_chunked(file_path: str, storage_config: Dict[str, Any]) -> s
     api_key = storage_config.get("api_key")
     request_id = storage_config.get("request_id")
     chunk_size = int(storage_config.get("chunk_size", 512000))  # 500KB default
-    batch_size = int(storage_config.get("batch_size", 10))  # 10 chunks at a time
+    batch_size = int(storage_config.get("batch_size", 3))  # 3 chunks at a time (reduced to avoid Cloudflare)
+    max_retries = int(storage_config.get("max_retries", 3))  # Retry failed chunks
 
     if not upload_endpoint:
         raise ValueError("Storage config must include upload_endpoint")
@@ -503,9 +531,9 @@ def _upload_to_http_chunked(file_path: str, storage_config: Dict[str, Any]) -> s
 
             print(f"[HTTP_CHUNKED] Uploading batch: chunks {batch_start + 1}-{batch_end} of {total_chunks}")
 
-            # Prepare args for parallel upload
+            # Prepare args for parallel upload (pass max_retries instead of total_chunks)
             upload_args = [
-                (chunk_index, chunk_data, upload_url, base_headers, total_chunks)
+                (chunk_index, chunk_data, upload_url, base_headers, max_retries)
                 for chunk_index, chunk_data in batch_chunks
             ]
 
