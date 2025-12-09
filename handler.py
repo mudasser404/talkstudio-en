@@ -346,25 +346,37 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
             headers=headers,
             timeout=300
         )
-        
-        response.raise_for_status()
+
+        print(f"[HTTP_UPLOAD] Response status: {response.status_code}")
+        print(f"[HTTP_UPLOAD] Response headers: {dict(response.headers)}")
+
+        if response.status_code != 200:
+            error_body = response.text[:500]  # First 500 chars
+            print(f"[HTTP_UPLOAD] Error response body: {error_body}")
+            raise Exception(
+                f"Upload failed with status {response.status_code}. "
+                f"Server response: {error_body}"
+            )
 
         # Handle different response formats
         try:
             result = response.json()
+            print(f"[HTTP_UPLOAD] JSON response: {result}")
             audio_url = result.get("url") or result.get("file_url") or result.get("audio_url")
-        except:
+        except Exception as json_err:
             # If not JSON, assume the response text is the URL
+            print(f"[HTTP_UPLOAD] Non-JSON response, treating as URL: {response.text[:100]}")
             audio_url = response.text.strip()
 
         if not audio_url:
-            raise Exception("Upload endpoint did not return URL")
-        
+            raise Exception(f"Upload endpoint did not return URL. Response: {response.text[:200]}")
+
         print(f"[HTTP_UPLOAD] ✓ Complete audio uploaded: {audio_url}")
         return audio_url
-        
+
     except Exception as e:
         print(f"[HTTP_UPLOAD] ✗ Upload failed: {e}")
+        print(f"[HTTP_UPLOAD] Error type: {type(e).__name__}")
         raise Exception(f"Failed to upload to VPS: {str(e)}")
 
 
@@ -703,7 +715,8 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             
         else:
             # Base64 for small files
-            max_base64_mb = 8.0
+            # TEMPORARY: Increased to 80MB while upload endpoint is being fixed
+            max_base64_mb = 80.0
             
             if file_size_mb > max_base64_mb:
                 error_msg = (
