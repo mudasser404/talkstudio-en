@@ -11,7 +11,7 @@ import runpod
 import torch
 from scipy.io import wavfile
 
-# ==============================
+# ==============================z
 # Patch F5-TTS to avoid torchaudio/torchcodec
 # ==============================
 def patch_utils_infer() -> None:
@@ -342,20 +342,57 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
     wavfile.write(final_path, sr_final, final_audio)
 
-    with open(final_path, "rb") as f:
-        audio_bytes = f.read()
+    # Get file size
+    file_size = os.path.getsize(final_path)
+    file_size_mb = file_size / (1024 * 1024)
 
-    os.remove(final_path)
+    # Check if storage config is provided
+    storage_config = inp.get("storage")
 
-    return {
-        "audio_base64": base64.b64encode(audio_bytes).decode("utf-8"),
+    # Define safe base64 limit (5MB = ~6.67MB base64 encoded)
+    # RunPod has response size limits, so we must enforce this
+    base64_size_limit_mb = 5.0
+
+    result = {
         "sample_rate": sr_final,
         "ref_text_used": ref_text,
         "num_chunks": len(chunks),
         "quality": quality,
         "volume": volume,
         "pause_s": pause_seconds,
+        "file_size_mb": round(file_size_mb, 2),
     }
+
+    try:
+        if storage_config:
+            # Upload to storage and return URL
+            print(f"[STORAGE] Uploading {file_size_mb:.2f}MB file to storage...")
+            audio_url = _upload_to_storage(final_path, storage_config)
+            result["audio_url"] = audio_url
+            print(f"[STORAGE] ✓ Uploaded successfully: {audio_url}")
+        else:
+            # Check if file is too large for base64
+            if file_size_mb > base64_size_limit_mb:
+                error_msg = (
+                    f"Audio file is too large ({file_size_mb:.2f}MB) to return as base64. "
+                    f"Maximum allowed: {base64_size_limit_mb}MB. "
+                    f"Please provide 'storage' configuration in your request to upload the file to S3/R2/Bunny/etc. "
+                    f"Otherwise, reduce text length or increase speed parameter."
+                )
+                print(f"[ERROR] {error_msg}")
+                raise ValueError(error_msg)
+
+            # Return base64 for smaller files
+            with open(final_path, "rb") as f:
+                audio_bytes = f.read()
+            result["audio_base64"] = base64.b64encode(audio_bytes).decode("utf-8")
+            print(f"[OUTPUT] Returning {file_size_mb:.2f}MB file as base64")
+
+    finally:
+        if os.path.exists(final_path):
+            os.remove(final_path)
+
+    return result
 
 
 # ==============================
