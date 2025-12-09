@@ -10,8 +10,9 @@ import requests
 import runpod
 import torch
 from scipy.io import wavfile
+import paramiko
 
-# ==============================z
+# ==============================
 # Patch F5-TTS to avoid torchaudio/torchcodec
 # ==============================
 def patch_utils_infer() -> None:
@@ -106,7 +107,6 @@ def get_asr_model() -> WhisperModel:
         print("[ASR] torch.cuda.is_available():", torch.cuda.is_available())
         print("[ASR] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
 
-        # 🔥 FIX: Always use CPU for ASR
         device = "cpu"
         compute_type = "int8"
         print("[ASR] FORCING CPU MODE to avoid cuDNN crash")
@@ -121,6 +121,204 @@ def get_asr_model() -> WhisperModel:
         print("======== END INIT ASR MODEL ========")
 
     return _asr_model
+
+
+# ==============================
+# Streaming VPS Upload (Memory Efficient)
+# ==============================
+def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> str:
+    """
+    Upload COMPLETE audio file to VPS using STREAMING to avoid memory issues.
+    File is uploaded in chunks without loading entire file in memory.
+    """
+    host = storage_config.get("72.61.125.201")
+    port = int(storage_config.get("port", 22))
+    username = storage_config.get("root")
+    password = storage_config.get("Ryk112233@@@")
+    key_file = storage_config.get("runpod_audio")
+    remote_path = storage_config.get("/media/runpod_audio")
+    base_url = storage_config.get("https://demo.talkstudio.ai")
+
+    if not all([host, username, remote_path, base_url]):
+        raise ValueError("Storage config must include host, username, remote_path, and base_url")
+
+    # Generate unique filename
+    import uuid
+    from datetime import datetime
+    
+    timestamp = datetime.utcnow().strftime("%Y/%m/%d")
+    unique_id = str(uuid.uuid4())
+    filename = f"runpod_{unique_id}.wav"
+    
+    # Create remote directory path
+    remote_dir = os.path.join(remote_path, timestamp)
+    remote_file_path = os.path.join(remote_dir, filename)
+    
+    # Public URL
+    public_url = f"{base_url.rstrip('/')}/{timestamp}/{filename}"
+
+    ssh = None
+    sftp = None
+    
+    try:
+        print(f"[UPLOAD] Connecting to {host}...")
+        
+        # Setup SSH connection with compression
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Connect
+        if key_file:
+            ssh.connect(
+                host, 
+                port=port, 
+                username=username, 
+                key_filename=key_file,
+                compress=True
+            )
+        else:
+            ssh.connect(
+                host, 
+                port=port, 
+                username=username, 
+                password=password,
+                compress=True
+            )
+        
+        print(f"[UPLOAD] Connected successfully")
+        
+        # Create directory
+        stdin, stdout, stderr = ssh.exec_command(f"mkdir -p {remote_dir}")
+        stdout.channel.recv_exit_status()
+        
+        # Open SFTP
+        sftp = ssh.open_sftp()
+        
+        # Get file size
+        file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        
+        print(f"[UPLOAD] Uploading COMPLETE audio file: {file_size_mb:.2f}MB")
+        print(f"[UPLOAD] This is the FINAL combined audio, not chunks")
+        
+        # Stream upload
+        CHUNK_SIZE = 32768  # 32KB chunks for network transfer
+        uploaded_bytes = 0
+        
+        with sftp.open(remote_file_path, 'wb') as remote_file:
+            with open(file_path, 'rb') as local_file:
+                while True:
+                    chunk = local_file.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    
+                    remote_file.write(chunk)
+                    uploaded_bytes += len(chunk)
+                    
+                    # Progress every 5MB
+                    if uploaded_bytes % (5 * 1024 * 1024) < CHUNK_SIZE:
+                        progress = (uploaded_bytes / file_size) * 100
+                        print(f"[UPLOAD] Progress: {progress:.1f}% ({uploaded_bytes / (1024*1024):.2f}MB / {file_size_mb:.2f}MB)")
+        
+        print(f"[UPLOAD] ✓ Complete audio uploaded: {file_size_mb:.2f}MB")
+        
+        # Set permissions
+        sftp.chmod(remote_file_path, 0o644)
+        
+        # Close connections
+        sftp.close()
+        ssh.close()
+        
+        print(f"[UPLOAD] ✓ File accessible at: {public_url}")
+        
+        return public_url
+        
+    except Exception as e:
+        print(f"[UPLOAD] ✗ Upload failed: {e}")
+        if sftp:
+            sftp.close()
+        if ssh:
+            ssh.close()
+        raise Exception(f"Failed to upload to VPS: {str(e)}")
+
+
+# ==============================
+# HTTP Streaming Upload
+# ==============================
+def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]) -> str:
+    """
+    Upload COMPLETE file via HTTP POST with streaming
+    """
+    upload_endpoint = storage_config.get("upload_endpoint")
+    api_key = storage_config.get("api_key")
+
+    if not upload_endpoint:
+        raise ValueError("Storage config must include upload_endpoint")
+
+    try:
+        file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        
+        print(f"[HTTP_UPLOAD] Uploading COMPLETE audio: {file_size_mb:.2f}MB")
+        
+        headers = {"Content-Type": "audio/wav"}
+        if api_key:
+            headers["X-API-Key"] = api_key
+        
+        # Stream upload
+        def file_generator():
+            CHUNK_SIZE = 65536  # 64KB
+            uploaded = 0
+            with open(file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    uploaded += len(chunk)
+                    
+                    if uploaded % (5 * 1024 * 1024) < CHUNK_SIZE:
+                        progress = (uploaded / file_size) * 100
+                        print(f"[HTTP_UPLOAD] Progress: {progress:.1f}%")
+                    
+                    yield chunk
+        
+        response = requests.post(
+            upload_endpoint,
+            data=file_generator(),
+            headers=headers,
+            timeout=300
+        )
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        audio_url = result.get("url")
+        if not audio_url:
+            raise Exception("Upload endpoint did not return URL")
+        
+        print(f"[HTTP_UPLOAD] ✓ Complete audio uploaded: {audio_url}")
+        return audio_url
+        
+    except Exception as e:
+        print(f"[HTTP_UPLOAD] ✗ Upload failed: {e}")
+        raise Exception(f"Failed to upload to VPS: {str(e)}")
+
+
+# ==============================
+# Main Upload Router
+# ==============================
+def _upload_to_storage(file_path: str, storage_config: Dict[str, Any]) -> str:
+    """
+    Route to appropriate streaming upload method
+    """
+    method = storage_config.get("method", "sftp").lower()
+    
+    if method == "sftp":
+        return _upload_to_vps_streaming(file_path, storage_config)
+    elif method == "http":
+        return _upload_to_vps_http_streaming(file_path, storage_config)
+    else:
+        raise ValueError(f"Unsupported upload method: {method}")
 
 
 # ==============================
@@ -191,7 +389,10 @@ def _chunk_text(
     max_chars: int = 200,
     min_chars: int = 80,
 ) -> List[str]:
-
+    """
+    Split text into chunks for TTS processing.
+    NOTE: These chunks are only for TTS processing - final output is ONE combined audio file.
+    """
     sentences = _split_into_sentences(text)
     chunks, current = [], ""
 
@@ -256,8 +457,60 @@ def _tts_chunk(
             os.remove(out_path)
 
 
-def _concat_audio(segments: List[np.ndarray]) -> np.ndarray:
-    return np.concatenate(segments, axis=0)
+def _concat_audio_streaming(segments: List[np.ndarray], output_path: str, sr: int) -> int:
+    """
+    Combine ALL audio segments into ONE complete file.
+    This creates the FINAL audio that will be uploaded.
+    Memory-efficient: writes directly to disk.
+    """
+    import struct
+    
+    print(f"[COMBINE] Merging {len(segments)} audio segments into ONE complete file...")
+    
+    # Calculate total samples
+    total_samples = sum(len(seg) for seg in segments)
+    total_duration = total_samples / sr
+    
+    print(f"[COMBINE] Total duration: {total_duration:.2f} seconds")
+    
+    # Write WAV file
+    with open(output_path, 'wb') as f:
+        # WAV header
+        f.write(b'RIFF')
+        f.write(struct.pack('<I', 0))  # Placeholder
+        f.write(b'WAVE')
+        
+        # Format chunk
+        f.write(b'fmt ')
+        f.write(struct.pack('<I', 16))
+        f.write(struct.pack('<H', 1))   # PCM
+        f.write(struct.pack('<H', 1))   # Mono
+        f.write(struct.pack('<I', sr))
+        f.write(struct.pack('<I', sr * 2))
+        f.write(struct.pack('<H', 2))
+        f.write(struct.pack('<H', 16))
+        
+        # Data chunk
+        f.write(b'data')
+        data_size = total_samples * 2
+        f.write(struct.pack('<I', data_size))
+        
+        # Write all segments
+        for i, segment in enumerate(segments):
+            segment.tofile(f)
+            del segment
+            
+            if (i + 1) % 10 == 0:
+                print(f"[COMBINE] Progress: {i + 1}/{len(segments)} segments merged")
+        
+        # Update file size
+        file_size = f.tell()
+        f.seek(4)
+        f.write(struct.pack('<I', file_size - 8))
+    
+    print(f"[COMBINE] ✓ Complete audio file created: {file_size / (1024*1024):.2f}MB")
+    
+    return file_size
 
 
 # ==============================
@@ -265,7 +518,8 @@ def _concat_audio(segments: List[np.ndarray]) -> np.ndarray:
 # ==============================
 def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
-    print("### handler version: f5tts_youtube_pauses_2025-12-09 ###")
+    print("### handler version: f5tts_complete_audio_2025-12-09 ###")
+    print("### NOTE: All chunks will be COMBINED into ONE complete audio file ###")
 
     inp = job.get("input", {})
 
@@ -279,35 +533,25 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     if not ref_text:
         ref_text = _transcribe_ref_audio(ref_path, language=inp.get("language"))
 
-    # Chunking - optimized for better processing
-    # Smaller chunks are better for F5-TTS quality and avoid memory issues
+    # Chunking (for TTS processing only - output will be ONE file)
     max_chars = int(inp.get("chunk_max_chars", 150))
     min_chars = int(inp.get("chunk_min_chars", 50))
     chunks = _chunk_text(raw_text, max_chars=max_chars, min_chars=min_chars)
 
-    print(f"[chunking] chunks={len(chunks)} max_chars={max_chars} min_chars={min_chars}")
-
-    # Log each chunk for debugging
-    for i, chunk in enumerate(chunks, 1):
-        print(f"[CHUNK {i}] {len(chunk)} chars: {chunk[:60]}...")
+    print(f"[PROCESSING] Will process {len(chunks)} text chunks")
+    print(f"[PROCESSING] These will be COMBINED into ONE complete audio file")
 
     # Synthesis settings
     speed = float(inp.get("speed", 0.7))
     remove_silence = bool(inp.get("remove_silence", False))
-
     quality = (inp.get("quality") or "standard").lower()
     nfe_step = 64 if quality == "premium" else 32
-
     volume = float(inp.get("volume", 1.0))
     volume = max(volume, 0.0)
     target_rms = 0.1 * volume
-
     pause_seconds = float(inp.get("pause_s", 0.12))
 
-    print(
-        f"[SYNTH] speed={speed}, quality={quality}, nfe_step={nfe_step}, "
-        f"volume={volume}, pause_s={pause_seconds}"
-    )
+    print(f"[SYNTH] speed={speed}, quality={quality}, nfe_step={nfe_step}, volume={volume}, pause_s={pause_seconds}")
 
     api = get_f5tts_model()
 
@@ -317,7 +561,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     # Generate each chunk
     for idx, chunk in enumerate(chunks, start=1):
         cleaned = _clean_for_tts(chunk)
-        print(f"[TTS] Chunk {idx}/{len(chunks)} ({len(cleaned)} chars)")
+        print(f"[TTS] Processing chunk {idx}/{len(chunks)} ({len(cleaned)} chars)")
 
         audio_np = _tts_chunk(
             api,
@@ -332,71 +576,89 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
         all_segments.append(audio_np)
 
-        # Insert pause
+        # Insert pause between chunks
         if idx < len(chunks) and pause_seconds > 0:
             pause_samples = int(sr_final * pause_seconds)
             silence = np.zeros(pause_samples, dtype=np.int16)
             all_segments.append(silence)
 
-    # Final audio
-    final_audio = _concat_audio(all_segments)
-
-    # Output
+    # Create ONE complete audio file
     fd, final_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
 
-    wavfile.write(final_path, sr_final, final_audio)
-
-    # Get file size
-    file_size = os.path.getsize(final_path)
+    print("[FINAL] Creating complete combined audio file...")
+    file_size = _concat_audio_streaming(all_segments, final_path, sr_final)
+    
+    # Clear memory
+    del all_segments
+    
     file_size_mb = file_size / (1024 * 1024)
+    print(f"[FINAL] Complete audio ready: {file_size_mb:.2f}MB")
 
-    # Check if storage config is provided
+    # Storage config
     storage_config = inp.get("storage")
-
-    # Define safe base64 limit (80MB file = ~107MB base64 encoded)
-    # RunPod can handle large responses, but extremely large files should use storage
-    base64_size_limit_mb = 80.0
+    auto_upload_threshold_mb = float(inp.get("auto_upload_threshold_mb", 3.0))
 
     result = {
         "sample_rate": sr_final,
         "ref_text_used": ref_text,
-        "num_chunks": len(chunks),
+        "num_chunks_processed": len(chunks),
         "quality": quality,
         "volume": volume,
         "pause_s": pause_seconds,
         "file_size_mb": round(file_size_mb, 2),
+        "output_type": "complete_audio"  # Clarify this is ONE complete file
     }
 
     try:
-        if storage_config:
-            # Upload to storage and return URL
-            print(f"[STORAGE] Uploading {file_size_mb:.2f}MB file to storage...")
+        # Upload if storage config provided OR file too large
+        should_upload = storage_config and (file_size_mb > auto_upload_threshold_mb or storage_config.get("force_upload", False))
+        
+        if should_upload:
+            print(f"[OUTPUT] Uploading COMPLETE audio file to VPS...")
+            
             audio_url = _upload_to_storage(final_path, storage_config)
             result["audio_url"] = audio_url
-            print(f"[STORAGE] ✓ Uploaded successfully: {audio_url}")
+            result["uploaded"] = True
+            
+            if file_size_mb > auto_upload_threshold_mb:
+                result["upload_reason"] = f"file_size_exceeds_{auto_upload_threshold_mb}mb"
+            else:
+                result["upload_reason"] = "storage_config_provided"
+            
+            print(f"[OUTPUT] ✓ Complete audio available at: {audio_url}")
+            
         else:
-            # Check if file is too large for base64
-            if file_size_mb > base64_size_limit_mb:
+            # Base64 for small files
+            max_base64_mb = 8.0
+            
+            if file_size_mb > max_base64_mb:
                 error_msg = (
-                    f"Audio file is too large ({file_size_mb:.2f}MB) to return as base64. "
-                    f"Maximum allowed: {base64_size_limit_mb}MB. "
-                    f"Please provide 'storage' configuration in your request to upload the file to S3/R2/Bunny/etc. "
-                    f"Otherwise, reduce text length or increase speed parameter."
+                    f"File too large ({file_size_mb:.2f}MB) for base64 response. "
+                    f"Maximum: {max_base64_mb}MB. "
+                    f"Please provide 'storage' configuration to upload to VPS."
                 )
                 print(f"[ERROR] {error_msg}")
                 raise ValueError(error_msg)
 
-            # Return base64 for smaller files
+            print(f"[OUTPUT] Encoding complete audio as base64...")
             with open(final_path, "rb") as f:
                 audio_bytes = f.read()
-            result["audio_base64"] = base64.b64encode(audio_bytes).decode("utf-8")
-            print(f"[OUTPUT] Returning {file_size_mb:.2f}MB file as base64")
+            
+            base64_str = base64.b64encode(audio_bytes).decode("utf-8")
+            result["audio_base64"] = base64_str
+            result["uploaded"] = False
+            
+            print(f"[OUTPUT] ✓ Complete audio encoded as base64")
 
     finally:
+        # Cleanup
         if os.path.exists(final_path):
             os.remove(final_path)
+            print("[CLEANUP] Temp files removed")
 
+    print("[SUCCESS] ONE complete audio file generated and delivered!")
+    
     return result
 
 
@@ -404,3 +666,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 # RunPod Entry
 # ==============================
 runpod.serverless.start({"handler": generate_speech})
+   
+
+
+
