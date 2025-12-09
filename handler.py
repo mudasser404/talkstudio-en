@@ -161,29 +161,32 @@ def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> 
     sftp = None
     
     try:
-        print(f"[UPLOAD] Connecting to {host}...")
-        
+        print(f"[UPLOAD] Connecting to {host}:{port} as {username}...")
+        print(f"[UPLOAD] Using password authentication: {bool(password)}")
+        print(f"[UPLOAD] Using key file: {key_file or 'None'}")
+
         # Setup SSH connection with compression
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
         # Connect
+        connect_kwargs = {
+            "hostname": host,
+            "port": port,
+            "username": username,
+            "compress": True,
+            "look_for_keys": False,  # Don't use SSH keys from ~/.ssh
+            "allow_agent": False,    # Don't use SSH agent
+        }
+
         if key_file:
-            ssh.connect(
-                host, 
-                port=port, 
-                username=username, 
-                key_filename=key_file,
-                compress=True
-            )
+            connect_kwargs["key_filename"] = key_file
+        elif password:
+            connect_kwargs["password"] = password
         else:
-            ssh.connect(
-                host, 
-                port=port, 
-                username=username, 
-                password=password,
-                compress=True
-            )
+            raise ValueError("Either password or key_file must be provided")
+
+        ssh.connect(**connect_kwargs)
         
         print(f"[UPLOAD] Connected successfully")
         
@@ -290,9 +293,15 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
         )
         
         response.raise_for_status()
-        result = response.json()
-        
-        audio_url = result.get("url")
+
+        # Handle different response formats
+        try:
+            result = response.json()
+            audio_url = result.get("url") or result.get("file_url") or result.get("audio_url")
+        except:
+            # If not JSON, assume the response text is the URL
+            audio_url = response.text.strip()
+
         if not audio_url:
             raise Exception("Upload endpoint did not return URL")
         
@@ -542,8 +551,9 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     print(f"[PROCESSING] These will be COMBINED into ONE complete audio file")
 
     # Synthesis settings
-    speed = float(inp.get("speed", 0.7))
-    remove_silence = bool(inp.get("remove_silence", False))
+    # Higher default speed to reduce file size for long texts
+    speed = float(inp.get("speed", 1.0))  # Changed from 0.7 to 1.0 for faster/smaller files
+    remove_silence = bool(inp.get("remove_silence", True))  # Enable by default to reduce size
     quality = (inp.get("quality") or "standard").lower()
     nfe_step = 64 if quality == "premium" else 32
     volume = float(inp.get("volume", 1.0))
@@ -595,9 +605,22 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     file_size_mb = file_size / (1024 * 1024)
     print(f"[FINAL] Complete audio ready: {file_size_mb:.2f}MB")
 
-    # Storage config
+    # Storage config - create default if not provided
     storage_config = inp.get("storage")
-    auto_upload_threshold_mb = float(inp.get("auto_upload_threshold_mb", 3.0))
+    auto_upload_threshold_mb = float(inp.get("auto_upload_threshold_mb", 8.0))
+
+    # If no storage config but file will likely be large, create default config
+    if not storage_config and file_size_mb > auto_upload_threshold_mb:
+        print(f"[AUTO-CONFIG] File is {file_size_mb:.2f}MB, creating default VPS storage config")
+        storage_config = {
+            "method": "sftp",
+            "host": "72.61.125.201",
+            "port": 22,
+            "username": "root",
+            "password": "Ryk112233@@@",
+            "remote_path": "/media/runpod_audio",
+            "base_url": "https://demo.talkstudio.ai"
+        }
 
     result = {
         "sample_rate": sr_final,
@@ -612,9 +635,9 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         # Upload if storage config provided OR file too large
-        should_upload = storage_config and (file_size_mb > auto_upload_threshold_mb or storage_config.get("force_upload", False))
-        
-        if should_upload:
+        should_upload = storage_config is not None
+
+        if should_upload and file_size_mb > auto_upload_threshold_mb:
             print(f"[OUTPUT] Uploading COMPLETE audio file to VPS...")
             
             audio_url = _upload_to_storage(final_path, storage_config)
