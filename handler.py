@@ -8,18 +8,17 @@ import requests
 import runpod
 
 
-# -------------------------
-# Patch F5-TTS to avoid torchaudio/torchcodec for audio loading
-# -------------------------
+# ==============================
+# Patch F5-TTS to avoid torchaudio/torchcodec
+# ==============================
 def patch_utils_infer() -> None:
     """
     Patch src/f5_tts/infer/utils_infer.py so that:
 
-      audio, sr = torchaudio.load(ref_audio)
+        audio, sr = torchaudio.load(ref_audio)
 
-    is replaced with a SciPy-based loader, avoiding TorchCodec entirely.
+    is replaced with a SciPy-based loader, avoiding TorchCodec completely.
     """
-    # handler.py will be copied into /workspace/F5-TTS
     utils_file = Path(__file__).parent / "src" / "f5_tts" / "infer" / "utils_infer.py"
 
     if not utils_file.exists():
@@ -28,49 +27,13 @@ def patch_utils_infer() -> None:
 
     text = utils_file.read_text()
 
-    old_snippet = (
-        "def infer_process(\n"
-        "    ref_audio,\n"
-        "    ref_text,\n"
-        "    gen_text,\n"
-        "    model_obj,\n"
-        "    vocoder,\n"
-        "    mel_spec_type=mel_spec_type,\n"
-        "    show_info=print,\n"
-        "    progress=tqdm,\n"
-        "    target_rms=target_rms,\n"
-        "    cross_fade_duration=cross_fade_duration,\n"
-        "    nfe_step=nfe_step,\n"
-        "    cfg_strength=cfg_strength,\n"
-        "    sway_sampling_coef=sway_sampling_coef,\n"
-        "    speed=speed,\n"
-        "    fix_duration=fix_duration,\n"
-        "    device=device,\n"
-        "):\n"
-        "    # Split the input text into batches\n"
-        "    audio, sr = torchaudio.load(ref_audio)\n"
-    )
+    if "audio, sr = torchaudio.load(ref_audio)" not in text:
+        print("[patch_utils_infer] No torchaudio.load() found (maybe already patched).")
+        return
 
-    new_snippet = (
-        "def infer_process(\n"
-        "    ref_audio,\n"
-        "    ref_text,\n"
-        "    gen_text,\n"
-        "    model_obj,\n"
-        "    vocoder,\n"
-        "    mel_spec_type=mel_spec_type,\n"
-        "    show_info=print,\n"
-        "    progress=tqdm,\n"
-        "    target_rms=target_rms,\n"
-        "    cross_fade_duration=cross_fade_duration,\n"
-        "    nfe_step=nfe_step,\n"
-        "    cfg_strength=cfg_strength,\n"
-        "    sway_sampling_coef=sway_sampling_coef,\n"
-        "    speed=speed,\n"
-        "    fix_duration=fix_duration,\n"
-        "    device=device,\n"
-        "):\n"
-        "    # Split the input text into batches\n"
+    old_line = "    audio, sr = torchaudio.load(ref_audio)"
+
+    new_block = (
         "    # Load audio with SciPy instead of torchaudio.load to avoid TorchCodec backend\n"
         "    from scipy.io import wavfile\n"
         "    import numpy as np\n"
@@ -92,11 +55,7 @@ def patch_utils_infer() -> None:
         "        audio = torch.from_numpy(audio_np.T)\n"
     )
 
-    if "audio, sr = torchaudio.load(ref_audio)" not in text:
-        print("[patch_utils_infer] No torchaudio.load() found in utils_infer.py (already patched?).")
-        return
-
-    text = text.replace(old_snippet, new_snippet)
+    text = text.replace(old_line, new_block)
     utils_file.write_text(text)
     print("[patch_utils_infer] ✓ Patched utils_infer.py to use SciPy audio loading.")
 
@@ -104,16 +63,18 @@ def patch_utils_infer() -> None:
 # Apply patch BEFORE importing F5TTS
 patch_utils_infer()
 
-from f5_tts.api import F5TTS  # noqa: E402  (import after patch)
+from f5_tts.api import F5TTS  # noqa: E402
+from faster_whisper import WhisperModel  # noqa: E402
 
 
-# -------------------------
-# Global model (reused across jobs)
-# -------------------------
+# ==============================
+# Global models (reused across jobs)
+# ==============================
 _f5tts_model: Optional[F5TTS] = None
+_asr_model: Optional[WhisperModel] = None
 
 
-def get_model() -> F5TTS:
+def get_f5tts_model() -> F5TTS:
     """
     Lazily initialize F5TTS v1 Base and keep it in memory for warm workers.
     """
@@ -123,12 +84,31 @@ def get_model() -> F5TTS:
             model="F5TTS_v1_Base",
             hf_cache_dir="/root/.cache/huggingface/hub",
         )
+        print("[get_f5tts_model] Loaded F5TTS_v1_Base")
     return _f5tts_model
 
 
-# -------------------------
-# Helpers
-# -------------------------
+def get_asr_model() -> WhisperModel:
+    """
+    Lazily initialize a faster-whisper model for transcribing reference audio.
+    Using a medium-sized English model for decent quality.
+    """
+    global _asr_model
+    if _asr_model is None:
+        # Use GPU if available, otherwise CPU
+        device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES", "") != "" else "cpu"
+        _asr_model = WhisperModel(
+            "medium.en",  # you can change to "small.en" if you want faster but slightly lower quality
+            device=device,
+            compute_type="float16" if device == "cuda" else "int8",
+        )
+        print(f"[get_asr_model] Loaded faster-whisper 'medium.en' on {device}")
+    return _asr_model
+
+
+# ==============================
+# Helper functions
+# ==============================
 def _save_b64_to_temp(b64_str: str, suffix: str = ".wav") -> str:
     audio_bytes = base64.b64decode(b64_str)
     fd, path = tempfile.mkstemp(suffix=suffix)
@@ -159,9 +139,26 @@ def _get_ref_audio_path(inp: Dict[str, Any]) -> str:
     raise ValueError("Provide either 'ref_audio_base64' or 'ref_audio_url' in input.")
 
 
-# -------------------------
+def _transcribe_ref_audio(ref_path: str, language: Optional[str] = None) -> str:
+    """
+    Use faster-whisper to get the transcript of the reference audio.
+    This becomes ref_text for F5TTS.
+    """
+    model = get_asr_model()
+    segments, info = model.transcribe(
+        ref_path,
+        beam_size=5,
+        language=language,  # None = auto-detect; use "en" to force English
+    )
+    text_parts = [seg.text.strip() for seg in segments if seg.text]
+    transcript = " ".join(text_parts).strip()
+    print(f"[ASR] Detected language={info.language}, text='{transcript[:80]}...'")
+    return transcript
+
+
+# ==============================
 # Main RunPod job handler
-# -------------------------
+# ==============================
 def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     Expected RunPod request format:
@@ -171,7 +168,8 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         "text": "Hello, this is F5TTS v1 base running on RunPod.",
         "ref_audio_url": "https://...wav",      # or "ref_audio_base64"
         "ref_audio_base64": "...",              # base64-encoded wav (optional if url is used)
-        "ref_text": "",                         # optional, transcript of reference audio
+        "ref_text": "",                         # optional, if empty we auto-transcribe with Whisper
+        "language": "en",                       # optional hint for ASR
         "remove_silence": true,                 # optional, default: false
         "speed": 1.0                            # optional, default: 1.0
       }
@@ -182,7 +180,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     {
       "audio_base64": "<base64 wav>",
       "sample_rate": 24000,
-      "ref_text_used": "some text"
+      "ref_text_used": "transcribed or provided text"
     }
     """
     inp: Dict[str, Any] = job.get("input") or {}
@@ -191,30 +189,39 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     if not text:
         return {"error": "Missing 'text' in input."}
 
+    # 1) Get reference audio
     try:
         ref_path = _get_ref_audio_path(inp)
     except Exception as e:
         return {"error": f"Failed to load reference audio: {e}"}
 
-    # IMPORTANT:
-    # We DO NOT call api.transcribe() here to avoid hitting Whisper + torchcodec.
-    # Instead, we always provide a non-empty ref_text so F5-TTS never tries to
-    # do its own ASR inside preprocess_ref_audio_text().
-    ref_text = inp.get("ref_text")
-    if not ref_text or not str(ref_text).strip():
+    # 2) Get or generate ref_text
+    ref_text = (inp.get("ref_text") or "").strip()
+    language_hint = inp.get("language")  # e.g. "en"; or None for auto-detect
+
+    if not ref_text:
+        try:
+            ref_text = _transcribe_ref_audio(ref_path, language=language_hint)
+        except Exception as e:
+            print(f"[WARN] ASR failed: {e}")
+            ref_text = ""
+
+    if not ref_text:
+        # If ASR fails and nothing was provided, we still give a dummy text,
+        # but this should be rare now.
         ref_text = "This is the reference audio."
 
     remove_silence: bool = bool(inp.get("remove_silence", False))
     speed: float = float(inp.get("speed", 1.0))
 
-    api = get_model()
+    api = get_f5tts_model()
 
-    # Prepare output wav path
+    # 3) Prepare output wav path
     fd, out_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
 
     try:
-        # Run F5-TTS inference
+        # 4) Run F5-TTS inference
         wav, sr, _ = api.infer(
             ref_file=ref_path,
             ref_text=ref_text,
@@ -225,7 +232,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             file_spec=None,
         )
 
-        # Read generated wav & base64-encode it
+        # 5) Read generated wav & base64-encode it
         with open(out_path, "rb") as f:
             audio_bytes = f.read()
         audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
@@ -254,7 +261,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             pass
 
 
-# -------------------------
+# ==============================
 # RunPod serverless entry
-# -------------------------
+# ==============================
 runpod.serverless.start({"handler": generate_speech})
