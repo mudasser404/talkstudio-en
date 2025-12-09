@@ -299,6 +299,7 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
 
     upload_endpoint = storage_config.get("upload_endpoint")
     api_key = storage_config.get("api_key")
+    request_id = storage_config.get("request_id")  # Get from storage config
 
     if not upload_endpoint:
         raise ValueError("Storage config must include upload_endpoint")
@@ -307,8 +308,11 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
         file_size = os.path.getsize(file_path)
         file_size_mb = file_size / (1024 * 1024)
 
-        # Generate unique request ID
-        request_id = str(uuid.uuid4())
+        # Use provided request_id or generate new one
+        if not request_id:
+            request_id = str(uuid.uuid4())
+            print(f"[HTTP_UPLOAD] WARNING: No request_id provided, generated new one: {request_id}")
+
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         filename = f"runpod_{timestamp}_{request_id[:8]}.wav"
 
@@ -675,6 +679,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     # Storage config - create default if not provided
     storage_config = inp.get("storage")
     auto_upload_threshold_mb = float(inp.get("auto_upload_threshold_mb", 8.0))
+    request_id = inp.get("request_id")  # Get request_id from input if provided
 
     # Auto-upload for large files
     if not storage_config and file_size_mb > auto_upload_threshold_mb:
@@ -683,6 +688,15 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             "method": "http",
             "upload_endpoint": "https://demo.talkstudio.ai/api/tts/api/runpod/upload/"
         }
+        # Add request_id to storage config if provided
+        if request_id:
+            storage_config["request_id"] = request_id
+            print(f"[AUTO-CONFIG] Using provided request_id: {request_id}")
+
+    # If storage config exists but no request_id in it, add from input
+    if storage_config and request_id and "request_id" not in storage_config:
+        storage_config["request_id"] = request_id
+        print(f"[CONFIG] Added request_id to storage config: {request_id}")
 
     result = {
         "sample_rate": sr_final,
