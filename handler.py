@@ -349,9 +349,9 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     # Check if storage config is provided
     storage_config = inp.get("storage")
 
-    # Define safe base64 limit (5MB = ~6.67MB base64 encoded)
-    # RunPod has response size limits, so we must enforce this
-    base64_size_limit_mb = 5.0
+    # Define safe base64 limit (30MB file = ~40MB base64 encoded)
+    # This allows large audio files to be returned directly
+    base64_size_limit_mb = 30.0
 
     result = {
         "sample_rate": sr_final,
