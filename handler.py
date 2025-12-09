@@ -75,9 +75,6 @@ _asr_model: Optional[WhisperModel] = None
 
 
 def get_f5tts_model() -> F5TTS:
-    """
-    Lazily initialize F5TTS v1 Base and keep it in memory for warm workers.
-    """
     global _f5tts_model
     if _f5tts_model is None:
         _f5tts_model = F5TTS(
@@ -90,24 +87,29 @@ def get_f5tts_model() -> F5TTS:
 
 def get_asr_model() -> WhisperModel:
     """
-    Lazily initialize a faster-whisper model for transcribing reference audio.
-    Using a medium-sized English model for decent quality.
+    Lazily init faster-whisper.
+
+    For 'best' quality, you can use:
+      - model_name = "large-v3"  (heavier, best quality)
+    If you want faster/cheaper, change to "medium.en" or "small.en".
     """
     global _asr_model
     if _asr_model is None:
-        # Use GPU if available, otherwise CPU
-        device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES", "") != "" else "cpu"
+        model_name = "large-v3"  # change to "medium.en" if VRAM is tight
+        device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+
         _asr_model = WhisperModel(
-            "medium.en",  # you can change to "small.en" if you want faster but slightly lower quality
+            model_name,
             device=device,
-            compute_type="float16" if device == "cuda" else "int8",
+            compute_type=compute_type,
         )
-        print(f"[get_asr_model] Loaded faster-whisper 'medium.en' on {device}")
+        print(f"[get_asr_model] Loaded faster-whisper '{model_name}' on {device} ({compute_type})")
     return _asr_model
 
 
 # ==============================
-# Helper functions
+# Helpers
 # ==============================
 def _save_b64_to_temp(b64_str: str, suffix: str = ".wav") -> str:
     audio_bytes = base64.b64decode(b64_str)
@@ -127,7 +129,6 @@ def _download_to_temp(url: str, suffix: str = ".wav") -> str:
 
 
 def _get_ref_audio_path(inp: Dict[str, Any]) -> str:
-    """Return path to a local temp wav file from either base64 or URL."""
     ref_b64 = inp.get("ref_audio_base64")
     ref_url = inp.get("ref_audio_url")
 
@@ -142,17 +143,16 @@ def _get_ref_audio_path(inp: Dict[str, Any]) -> str:
 def _transcribe_ref_audio(ref_path: str, language: Optional[str] = None) -> str:
     """
     Use faster-whisper to get the transcript of the reference audio.
-    This becomes ref_text for F5TTS.
     """
     model = get_asr_model()
     segments, info = model.transcribe(
         ref_path,
+        language=language,  # e.g. "en"; or None for auto-detect
         beam_size=5,
-        language=language,  # None = auto-detect; use "en" to force English
     )
-    text_parts = [seg.text.strip() for seg in segments if seg.text]
-    transcript = " ".join(text_parts).strip()
-    print(f"[ASR] Detected language={info.language}, text='{transcript[:80]}...'")
+    parts = [seg.text.strip() for seg in segments if seg.text]
+    transcript = " ".join(parts).strip()
+    print(f"[ASR] language={info.language}, text='{transcript[:80]}...'")
     return transcript
 
 
@@ -161,26 +161,18 @@ def _transcribe_ref_audio(ref_path: str, language: Optional[str] = None) -> str:
 # ==============================
 def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Expected RunPod request format:
+    Request:
 
     {
       "input": {
-        "text": "Hello, this is F5TTS v1 base running on RunPod.",
-        "ref_audio_url": "https://...wav",      # or "ref_audio_base64"
-        "ref_audio_base64": "...",              # base64-encoded wav (optional if url is used)
-        "ref_text": "",                         # optional, if empty we auto-transcribe with Whisper
-        "language": "en",                       # optional hint for ASR
-        "remove_silence": true,                 # optional, default: false
-        "speed": 1.0                            # optional, default: 1.0
+        "text": "Target text you want to speak.",
+        "ref_audio_url": "https://...wav",      // or "ref_audio_base64"
+        "ref_audio_base64": "...",
+        "ref_text": "",                         // optional; if empty we'll transcribe
+        "language": "en",                       // optional hint for ASR
+        "remove_silence": true,
+        "speed": 1.0
       }
-    }
-
-    Response:
-
-    {
-      "audio_base64": "<base64 wav>",
-      "sample_rate": 24000,
-      "ref_text_used": "transcribed or provided text"
     }
     """
     inp: Dict[str, Any] = job.get("input") or {}
@@ -189,34 +181,34 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     if not text:
         return {"error": "Missing 'text' in input."}
 
-    # 1) Get reference audio
+    # 1) Reference audio
     try:
         ref_path = _get_ref_audio_path(inp)
     except Exception as e:
         return {"error": f"Failed to load reference audio: {e}"}
 
-    # 2) Get or generate ref_text
+    # 2) ref_text: either provided by client, or via ASR
     ref_text = (inp.get("ref_text") or "").strip()
-    language_hint = inp.get("language")  # e.g. "en"; or None for auto-detect
+    language_hint = inp.get("language")  # e.g. "en"
 
     if not ref_text:
         try:
             ref_text = _transcribe_ref_audio(ref_path, language=language_hint)
         except Exception as e:
-            print(f"[WARN] ASR failed: {e}")
-            ref_text = ""
+            # ASR failed – better to be explicit than silently degrade quality
+            return {"error": f"ASR transcription failed: {e}"}
 
     if not ref_text:
-        # If ASR fails and nothing was provided, we still give a dummy text,
-        # but this should be rare now.
-        ref_text = "This is the reference audio."
+        return {
+            "error": "ASR produced empty transcript. Please provide 'ref_text' manually."
+        }
 
     remove_silence: bool = bool(inp.get("remove_silence", False))
     speed: float = float(inp.get("speed", 1.0))
 
     api = get_f5tts_model()
 
-    # 3) Prepare output wav path
+    # 3) Output file
     fd, out_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
 
@@ -228,11 +220,11 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             gen_text=text,
             speed=speed,
             remove_silence=remove_silence,
-            file_wave=out_path,  # also writes wav to file
+            file_wave=out_path,
             file_spec=None,
         )
 
-        # 5) Read generated wav & base64-encode it
+        # 5) Encode result
         with open(out_path, "rb") as f:
             audio_bytes = f.read()
         audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
@@ -247,7 +239,6 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"Inference failed: {e}"}
 
     finally:
-        # Clean up temp files
         try:
             if os.path.exists(ref_path):
                 os.remove(ref_path)
@@ -261,7 +252,4 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             pass
 
 
-# ==============================
-# RunPod serverless entry
-# ==============================
 runpod.serverless.start({"handler": generate_speech})
