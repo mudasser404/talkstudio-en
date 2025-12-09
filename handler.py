@@ -279,12 +279,17 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     if not ref_text:
         ref_text = _transcribe_ref_audio(ref_path, language=inp.get("language"))
 
-    # Chunking
-    max_chars = int(inp.get("chunk_max_chars", 200))
-    min_chars = int(inp.get("chunk_min_chars", 80))
+    # Chunking - optimized for better processing
+    # Smaller chunks are better for F5-TTS quality and avoid memory issues
+    max_chars = int(inp.get("chunk_max_chars", 150))
+    min_chars = int(inp.get("chunk_min_chars", 50))
     chunks = _chunk_text(raw_text, max_chars=max_chars, min_chars=min_chars)
 
     print(f"[chunking] chunks={len(chunks)} max_chars={max_chars} min_chars={min_chars}")
+
+    # Log each chunk for debugging
+    for i, chunk in enumerate(chunks, 1):
+        print(f"[CHUNK {i}] {len(chunk)} chars: {chunk[:60]}...")
 
     # Synthesis settings
     speed = float(inp.get("speed", 0.7))
@@ -349,9 +354,9 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     # Check if storage config is provided
     storage_config = inp.get("storage")
 
-    # Define safe base64 limit (30MB file = ~40MB base64 encoded)
-    # This allows large audio files to be returned directly
-    base64_size_limit_mb = 30.0
+    # Define safe base64 limit (80MB file = ~107MB base64 encoded)
+    # RunPod can handle large responses, but extremely large files should use storage
+    base64_size_limit_mb = 80.0
 
     result = {
         "sample_rate": sr_final,
