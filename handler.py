@@ -8,7 +8,46 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import requests
 import runpod
+import torch  # <-- NEW: for CUDA debug
 from scipy.io import wavfile
+
+
+# ==============================
+# Debug: CUDA / Environment
+# ==============================
+def _debug_cuda_env() -> None:
+    """
+    Print CUDA-related information so we can see what the container actually sees.
+    """
+    print("========== CUDA / ENV DEBUG ==========")
+    try:
+        print("[DEBUG] torch.__version__:", torch.__version__)
+    except Exception as e:
+        print("[DEBUG] torch.__version__ error:", e)
+
+    try:
+        print("[DEBUG] torch.cuda.is_available():", torch.cuda.is_available())
+    except Exception as e:
+        print("[DEBUG] torch.cuda.is_available() error:", e)
+
+    try:
+        count = torch.cuda.device_count()
+        print("[DEBUG] torch.cuda.device_count():", count)
+        for idx in range(count):
+            try:
+                print(f"[DEBUG] torch.cuda.get_device_name({idx}):", torch.cuda.get_device_name(idx))
+            except Exception as e_name:
+                print(f"[DEBUG] get_device_name({idx}) error:", e_name)
+    except Exception as e:
+        print("[DEBUG] torch.cuda.device_count() error:", e)
+
+    print("[DEBUG] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print("[DEBUG] NVIDIA_VISIBLE_DEVICES:", os.environ.get("NVIDIA_VISIBLE_DEVICES"))
+    print("======== END CUDA / ENV DEBUG ========")
+
+
+# Run debug once at import time
+_debug_cuda_env()
 
 
 # ==============================
@@ -80,11 +119,15 @@ _asr_model: Optional[WhisperModel] = None
 def get_f5tts_model() -> F5TTS:
     global _f5tts_model
     if _f5tts_model is None:
+        print("========== INIT F5TTS MODEL ==========")
+        print("[F5TTS] torch.cuda.is_available():", torch.cuda.is_available())
+        print("[F5TTS] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
         _f5tts_model = F5TTS(
             model="F5TTS_v1_Base",
             hf_cache_dir="/root/.cache/huggingface/hub",
         )
         print("[get_f5tts_model] Loaded F5TTS_v1_Base")
+        print("======== END INIT F5TTS MODEL ========")
     return _f5tts_model
 
 
@@ -96,15 +139,37 @@ def get_asr_model() -> WhisperModel:
     global _asr_model
     if _asr_model is None:
         model_name = "large-v3"  # best quality; change to "medium.en" if VRAM is tight
-        device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
+
+        print("========== INIT ASR MODEL ==========")
+        print("[ASR] torch.__version__:", torch.__version__)
+        print("[ASR] torch.cuda.is_available():", torch.cuda.is_available())
+        print("[ASR] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+
+        # Prefer actual CUDA detection over just env var
+        if torch.cuda.is_available():
+            device = "cuda"
+            compute_type = "float16"
+        else:
+            # Fallback to env-based check (as in your original code)
+            if os.environ.get("CUDA_VISIBLE_DEVICES"):
+                device = "cuda"
+                compute_type = "float16"
+            else:
+                device = "cpu"
+                compute_type = "int8"
+
+        print(f"[ASR] Selected device={device}, compute_type={compute_type}")
 
         _asr_model = WhisperModel(
             model_name,
             device=device,
             compute_type=compute_type,
         )
-        print(f"[get_asr_model] Loaded faster-whisper '{model_name}' on {device} ({compute_type})")
+        print(
+            f"[get_asr_model] Loaded faster-whisper '{model_name}' "
+            f"on {device} ({compute_type})"
+        )
+        print("======== END INIT ASR MODEL ========")
     return _asr_model
 
 
@@ -276,55 +341,42 @@ def _concat_audio(segments: List[np.ndarray]) -> np.ndarray:
 # Main RunPod job handler
 # ==============================
 def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Request:
+    print("##### BUILD VERSION: 2025-12-09-handler-real-01 #####")
 
-    {
-      "input": {
-        "text": "Very long YouTube script here...",
-        "ref_audio_url": "https://...wav",         // or "ref_audio_base64"
-        "ref_audio_base64": "...",
-        "ref_text": "",                            // optional; if empty, we'll transcribe
-        "language": "en",                          // optional hint for ASR
-        "remove_silence": true,                    // optional, default: false
-        "speed": 0.7,                              // optional, default: 0.7 (slower, YouTube-friendly)
-        "chunk_max_chars": 400,                    // optional
-        "chunk_min_chars": 150                     // optional
-      }
-    }
-
-    Response:
-
-    {
-      "audio_base64": "<base64 wav of ALL chunks>",
-      "sample_rate": 24000,
-      "ref_text_used": "transcribed or provided text",
-      "num_chunks": 42
-    }
-    """
     inp: Dict[str, Any] = job.get("input") or {}
 
     text = (inp.get("text") or "").strip()
     if not text:
+        print("[INPUT] Missing 'text' in input.")
         return {"error": "Missing 'text' in input."}
+
+    print(f"[INPUT] text length={len(text)}")
 
     # ---- 1) Reference audio ----
     try:
         ref_path = _get_ref_audio_path(inp)
+        print("[REF] Loaded reference audio:", ref_path)
     except Exception as e:
+        print("[ERROR] Failed to load reference audio:", e)
         return {"error": f"Failed to load reference audio: {e}"}
 
     # ---- 2) ref_text: use client-provided or ASR transcript ----
     ref_text = (inp.get("ref_text") or "").strip()
     language_hint = inp.get("language")  # e.g. "en"
+    print("[REF] language_hint:", language_hint)
 
-    if not ref_text:
+    if ref_text:
+        print(f"[REF] Using provided ref_text (len={len(ref_text)}): '{ref_text[:80]}'")
+    else:
+        print("[REF] No ref_text provided, running ASR...")
         try:
             ref_text = _transcribe_ref_audio(ref_path, language=language_hint)
         except Exception as e:
+            print("[ERROR] ASR transcription failed:", e)
             return {"error": f"ASR transcription failed: {e}"}
 
     if not ref_text:
+        print("[ERROR] ASR produced empty transcript.")
         return {
             "error": "ASR produced empty transcript. Please provide 'ref_text' manually."
         }
@@ -333,12 +385,15 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     max_chars = int(inp.get("chunk_max_chars", 400))
     min_chars = int(inp.get("chunk_min_chars", 150))
     chunks = _chunk_text(text, max_chars=max_chars, min_chars=min_chars)
-    print(f"[chunking] text length={len(text)}, num_chunks={len(chunks)}")
+    print(
+        f"[chunking] text length={len(text)}, num_chunks={len(chunks)}, "
+        f"max_chars={max_chars}, min_chars={min_chars}"
+    )
 
     # ---- 4) Synthesis settings ----
-    # Default 0.7 is slower and more natural for YouTube narration.
-    speed: float = float(inp.get("speed", 0.7))
+    speed: float = float(inp.get("speed", 0.7))  # slower default
     remove_silence: bool = bool(inp.get("remove_silence", False))
+    print(f"[SYNTH] speed={speed}, remove_silence={remove_silence}")
 
     api = get_f5tts_model()
 
@@ -359,23 +414,27 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             )
 
             if audio_np.size == 0:
+                print(f"[TTS] Chunk {idx} produced empty audio, skipping.")
                 continue
 
             # sample rate from first segment
             if sr_final is None:
-                # We know F5TTS_v1_Base uses 24kHz, but we can read from API config if needed.
-                sr_final = 24000
+                sr_final = 24000  # F5TTS_v1_Base default
+                print(f"[TTS] Sample rate set to {sr_final}")
 
             all_segments.append(audio_np)
 
         if not all_segments:
+            print("[ERROR] No audio was generated for any chunk.")
             return {"error": "No audio was generated for any chunk."}
 
         final_audio = _concat_audio(all_segments)
+        print(f"[TTS] Final audio samples={final_audio.shape[0]}")
 
         # ---- 6) Write final WAV and base64-encode ----
         fd, final_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
+        print("[OUTPUT] Writing final WAV to:", final_path)
 
         try:
             wavfile.write(final_path, sr_final, final_audio)
@@ -386,8 +445,11 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 if os.path.exists(final_path):
                     os.remove(final_path)
-            except Exception:
-                pass
+                    print("[OUTPUT] Deleted temp WAV:", final_path)
+            except Exception as e:
+                print("[WARN] Failed to delete temp WAV:", e)
+
+        print("[DONE] Request completed successfully.")
 
         return {
             "audio_base64": audio_b64,
@@ -397,14 +459,16 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     except Exception as e:
+        print("[FATAL] Inference failed:", e)
         return {"error": f"Inference failed: {e}"}
 
     finally:
         try:
             if os.path.exists(ref_path):
                 os.remove(ref_path)
-        except Exception:
-            pass
+                print("[CLEANUP] Deleted temp ref audio:", ref_path)
+        except Exception as e:
+            print("[WARN] Failed to delete temp ref audio:", e)
 
 
 # ==============================
