@@ -385,18 +385,137 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
 
 
 # ==============================
+# HTTP Chunked Upload (for large files > nginx limit)
+# ==============================
+def _upload_to_http_chunked(file_path: str, storage_config: Dict[str, Any]) -> str:
+    """
+    Upload file in chunks to bypass nginx size limits.
+    Each chunk is ~500KB which is under nginx's 1MB default limit.
+    Server must support chunked uploads with X-Chunk-Index headers.
+    """
+    import uuid
+    from datetime import datetime
+
+    upload_endpoint = storage_config.get("upload_endpoint")
+    api_key = storage_config.get("api_key")
+    request_id = storage_config.get("request_id")
+    chunk_size = int(storage_config.get("chunk_size", 512000))  # 500KB default
+
+    if not upload_endpoint:
+        raise ValueError("Storage config must include upload_endpoint")
+
+    try:
+        file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        total_chunks = (file_size + chunk_size - 1) // chunk_size  # Ceiling division
+
+        # Use provided request_id or generate new one
+        if not request_id:
+            request_id = str(uuid.uuid4())
+            print(f"[HTTP_CHUNKED] WARNING: No request_id provided, generated: {request_id}")
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"runpod_{timestamp}_{request_id[:8]}.wav"
+
+        print(f"[HTTP_CHUNKED] Uploading {file_size_mb:.2f}MB in {total_chunks} chunks")
+        print(f"[HTTP_CHUNKED] Request ID: {request_id}")
+        print(f"[HTTP_CHUNKED] Chunk size: {chunk_size / 1024:.0f}KB")
+        print(f"[HTTP_CHUNKED] Endpoint: {upload_endpoint}")
+
+        audio_url = None
+
+        with open(file_path, 'rb') as f:
+            for chunk_index in range(total_chunks):
+                chunk_data = f.read(chunk_size)
+                chunk_size_kb = len(chunk_data) / 1024
+
+                # Add request_id to URL parameter
+                upload_url = f"{upload_endpoint}?request_id={request_id}"
+
+                # Setup headers
+                headers = {
+                    "X-Request-Id": request_id,
+                    "X-Filename": filename,
+                    "X-Chunk-Index": str(chunk_index),
+                    "X-Total-Chunks": str(total_chunks),
+                    "Content-Type": "application/octet-stream"
+                }
+                if api_key:
+                    headers["X-API-Key"] = api_key
+
+                print(f"[HTTP_CHUNKED] Uploading chunk {chunk_index + 1}/{total_chunks} ({chunk_size_kb:.0f}KB)...")
+
+                response = requests.post(
+                    upload_url,
+                    data=chunk_data,
+                    headers=headers,
+                    timeout=120
+                )
+
+                if response.status_code != 200:
+                    error_body = response.text[:500]
+                    print(f"[HTTP_CHUNKED] Chunk {chunk_index + 1} failed: {error_body}")
+                    raise Exception(
+                        f"Chunk {chunk_index + 1} upload failed with status {response.status_code}. "
+                        f"Server response: {error_body}"
+                    )
+
+                # Try to parse response
+                try:
+                    result = response.json()
+                    print(f"[HTTP_CHUNKED] Chunk {chunk_index + 1} response: {result}")
+
+                    # Check if this was the last chunk and we got the final URL
+                    if result.get("url") or result.get("file_url") or result.get("audio_url"):
+                        audio_url = result.get("url") or result.get("file_url") or result.get("audio_url")
+                except:
+                    # Non-JSON response
+                    print(f"[HTTP_CHUNKED] Chunk {chunk_index + 1} uploaded successfully")
+
+                # Progress update
+                progress = ((chunk_index + 1) / total_chunks) * 100
+                print(f"[HTTP_CHUNKED] Progress: {progress:.1f}%")
+
+        if not audio_url:
+            # If server didn't return URL in chunks, make final request to get it
+            print(f"[HTTP_CHUNKED] Requesting final URL...")
+            final_url = f"{upload_endpoint}/finalize?request_id={request_id}"
+            response = requests.get(final_url, timeout=30)
+
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                    audio_url = result.get("url") or result.get("file_url") or result.get("audio_url")
+                except:
+                    audio_url = response.text.strip()
+
+        if not audio_url:
+            raise Exception(f"Upload completed but no URL returned for request_id: {request_id}")
+
+        print(f"[HTTP_CHUNKED] ✓ Complete audio uploaded: {audio_url}")
+        return audio_url
+
+    except Exception as e:
+        print(f"[HTTP_CHUNKED] ✗ Upload failed: {e}")
+        print(f"[HTTP_CHUNKED] Error type: {type(e).__name__}")
+        raise Exception(f"Failed to upload via chunked HTTP: {str(e)}")
+
+
+# ==============================
 # Main Upload Router
 # ==============================
 def _upload_to_storage(file_path: str, storage_config: Dict[str, Any]) -> str:
     """
     Route to appropriate streaming upload method
     """
-    method = storage_config.get("method", "sftp").lower()
-    
+    method = storage_config.get("method", "http").lower()
+
     if method == "sftp":
         return _upload_to_vps_streaming(file_path, storage_config)
     elif method == "http":
         return _upload_to_vps_http_streaming(file_path, storage_config)
+    elif method == "http_chunked":
+        return _upload_to_http_chunked(file_path, storage_config)
     else:
         raise ValueError(f"Unsupported upload method: {method}")
 
