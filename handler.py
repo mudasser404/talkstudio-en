@@ -131,13 +131,13 @@ def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> 
     Upload COMPLETE audio file to VPS using STREAMING to avoid memory issues.
     File is uploaded in chunks without loading entire file in memory.
     """
-    host = storage_config.get("72.61.125.201")
+    host = storage_config.get("host", "72.61.125.201")
     port = int(storage_config.get("port", 22))
-    username = storage_config.get("root")
-    password = storage_config.get("Ryk112233@@@")
-    key_file = storage_config.get("runpod_audio")
-    remote_path = storage_config.get("/media/runpod_audio")
-    base_url = storage_config.get("https://demo.talkstudio.ai")
+    username = storage_config.get("username", "root")
+    password = storage_config.get("password", "Ryk112233@@@")
+    key_file = storage_config.get("key_file")
+    remote_path = storage_config.get("remote_path", "/media/runpod_audio")
+    base_url = storage_config.get("base_url", "https://demo.talkstudio.ai")
 
     if not all([host, username, remote_path, base_url]):
         raise ValueError("Storage config must include host, username, remote_path, and base_url")

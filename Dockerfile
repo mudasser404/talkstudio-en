@@ -22,8 +22,8 @@ RUN git clone https://github.com/SWivid/F5-TTS.git \
  && pip install --upgrade pip \
  # Editable install of official F5-TTS (works with torch==2.4.0 from base image)
  && pip install -e . --no-cache-dir \
- # Extra deps we need: SciPy, RunPod SDK, HTTP client, faster-whisper, and boto3 for storage
- && pip install scipy requests runpod faster-whisper boto3 --no-cache-dir
+ # Extra deps we need: SciPy, RunPod SDK, HTTP client, faster-whisper, boto3 for storage, and paramiko for SFTP
+ && pip install scipy requests runpod faster-whisper boto3 paramiko --no-cache-dir
 
 # Hugging Face cache directory
 ENV HF_HOME=/root/.cache/huggingface
