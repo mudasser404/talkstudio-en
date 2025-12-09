@@ -190,12 +190,32 @@ def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> 
         
         print(f"[UPLOAD] Connected successfully")
         
-        # Create directory
-        stdin, stdout, stderr = ssh.exec_command(f"mkdir -p {remote_dir}")
-        stdout.channel.recv_exit_status()
-        
+        # Create directory and check
+        print(f"[UPLOAD] Creating directory: {remote_dir}")
+        stdin, stdout, stderr = ssh.exec_command(f"mkdir -p {remote_dir} && chmod 755 {remote_dir}")
+        exit_status = stdout.channel.recv_exit_status()
+
+        if exit_status != 0:
+            error_output = stderr.read().decode()
+            raise Exception(f"Failed to create directory: {error_output}")
+
+        # Check disk space
+        stdin, stdout, stderr = ssh.exec_command("df -h /media")
+        disk_info = stdout.read().decode()
+        print(f"[UPLOAD] Disk space:\n{disk_info}")
+
         # Open SFTP
         sftp = ssh.open_sftp()
+
+        # Test write permission
+        try:
+            test_file = os.path.join(remote_dir, ".test_write")
+            with sftp.open(test_file, 'w') as f:
+                f.write("test")
+            sftp.remove(test_file)
+            print(f"[UPLOAD] Write permission verified")
+        except Exception as e:
+            raise Exception(f"No write permission in {remote_dir}: {e}")
         
         # Get file size
         file_size = os.path.getsize(file_path)
@@ -238,11 +258,33 @@ def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> 
         
     except Exception as e:
         print(f"[UPLOAD] ✗ Upload failed: {e}")
+        print(f"[UPLOAD] Error type: {type(e).__name__}")
+
         if sftp:
-            sftp.close()
+            try:
+                sftp.close()
+            except:
+                pass
         if ssh:
-            ssh.close()
-        raise Exception(f"Failed to upload to VPS: {str(e)}")
+            try:
+                ssh.close()
+            except:
+                pass
+
+        # Provide helpful error message
+        error_msg = str(e)
+        if "Failure" in error_msg or "OSError" in str(type(e)):
+            raise Exception(
+                f"VPS upload failed - possible causes:\n"
+                f"1. Disk full on VPS (/media partition)\n"
+                f"2. No write permission to {remote_path}\n"
+                f"3. Directory path doesn't exist\n"
+                f"Original error: {error_msg}\n\n"
+                f"SOLUTION: Use HTTP upload method instead:\n"
+                f'{{"storage": {{"method": "http", "upload_endpoint": "https://demo.talkstudio.ai/api/upload"}}}}'
+            )
+        else:
+            raise Exception(f"Failed to upload to VPS: {error_msg}")
 
 
 # ==============================
@@ -252,6 +294,9 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
     """
     Upload COMPLETE file via HTTP POST with streaming
     """
+    import uuid
+    from datetime import datetime
+
     upload_endpoint = storage_config.get("upload_endpoint")
     api_key = storage_config.get("api_key")
 
@@ -261,13 +306,23 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
     try:
         file_size = os.path.getsize(file_path)
         file_size_mb = file_size / (1024 * 1024)
-        
+
+        # Generate unique filename
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        filename = f"runpod_{timestamp}_{unique_id}.wav"
+
         print(f"[HTTP_UPLOAD] Uploading COMPLETE audio: {file_size_mb:.2f}MB")
-        
-        headers = {"Content-Type": "audio/wav"}
+        print(f"[HTTP_UPLOAD] Filename: {filename}")
+        print(f"[HTTP_UPLOAD] Endpoint: {upload_endpoint}")
+
+        headers = {
+            "Content-Type": "audio/wav",
+            "X-Filename": filename  # Send filename in header
+        }
         if api_key:
             headers["X-API-Key"] = api_key
-        
+
         # Stream upload
         def file_generator():
             CHUNK_SIZE = 65536  # 64KB
@@ -278,13 +333,13 @@ def _upload_to_vps_http_streaming(file_path: str, storage_config: Dict[str, Any]
                     if not chunk:
                         break
                     uploaded += len(chunk)
-                    
+
                     if uploaded % (5 * 1024 * 1024) < CHUNK_SIZE:
                         progress = (uploaded / file_size) * 100
                         print(f"[HTTP_UPLOAD] Progress: {progress:.1f}%")
-                    
+
                     yield chunk
-        
+
         response = requests.post(
             upload_endpoint,
             data=file_generator(),
@@ -611,15 +666,10 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # If no storage config but file will likely be large, create default config
     if not storage_config and file_size_mb > auto_upload_threshold_mb:
-        print(f"[AUTO-CONFIG] File is {file_size_mb:.2f}MB, creating default VPS storage config")
+        print(f"[AUTO-CONFIG] File is {file_size_mb:.2f}MB, creating default HTTP upload config")
         storage_config = {
-            "method": "sftp",
-            "host": "72.61.125.201",
-            "port": 22,
-            "username": "root",
-            "password": "Ryk112233@@@",
-            "remote_path": "/media/runpod_audio",
-            "base_url": "https://demo.talkstudio.ai"
+            "method": "http",
+            "upload_endpoint": "https://demo.talkstudio.ai/api/tts/api/runpod/upload/"
         }
 
     result = {
