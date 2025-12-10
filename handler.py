@@ -475,9 +475,10 @@ def _upload_to_http_chunked(file_path: str, storage_config: Dict[str, Any]) -> s
     upload_endpoint = storage_config.get("upload_endpoint")
     api_key = storage_config.get("api_key")
     request_id = storage_config.get("request_id")
-    chunk_size = int(storage_config.get("chunk_size", 512000))  # 500KB default
-    batch_size = int(storage_config.get("batch_size", 3))  # 3 chunks at a time (reduced to avoid Cloudflare)
-    max_retries = int(storage_config.get("max_retries", 3))  # Retry failed chunks
+    chunk_size = int(storage_config.get("chunk_size", 2097152))  # 2MB default (reduced chunks count)
+    batch_size = int(storage_config.get("batch_size", 1))  # Sequential (Cloudflare blocks parallel)
+    max_retries = int(storage_config.get("max_retries", 5))  # More retries for rate limiting
+    delay_between_chunks = float(storage_config.get("delay_between_chunks", 0.5))  # 500ms delay
 
     if not upload_endpoint:
         raise ValueError("Storage config must include upload_endpoint")
@@ -559,6 +560,11 @@ def _upload_to_http_chunked(file_path: str, storage_config: Dict[str, Any]) -> s
             # Batch progress update
             progress = (batch_end / total_chunks) * 100
             print(f"[HTTP_CHUNKED] Progress: {progress:.1f}% ({batch_end}/{total_chunks} chunks uploaded)")
+
+            # Add delay between batches to avoid Cloudflare rate limiting
+            if batch_end < total_chunks and delay_between_chunks > 0:
+                import time
+                time.sleep(delay_between_chunks)
 
         # Clear chunks from memory
         del all_chunks
