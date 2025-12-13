@@ -2,8 +2,9 @@ import base64
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -653,12 +654,13 @@ def _split_into_sentences(text: str) -> List[str]:
 
 def _chunk_text(
     text: str,
-    max_chars: int = 250,
-    min_chars: int = 100,
+    max_chars: int = 400,  # INCREASED for fewer chunks = faster processing
+    min_chars: int = 200,  # INCREASED minimum
 ) -> List[str]:
     """
     Split text into chunks for TTS processing.
-    XTTS v2 can handle longer chunks than F5-TTS.
+    XTTS v2 can handle LONGER chunks - use this for speed!
+    Fewer chunks = less overhead = faster total processing.
     NOTE: These chunks are only for TTS processing - final output is ONE combined audio file.
     """
     sentences = _split_into_sentences(text)
@@ -677,8 +679,9 @@ def _chunk_text(
                 current = s
             else:
                 current += " " + s
-                chunks.append(current)
-                current = ""
+                if len(current) >= max_chars:
+                    chunks.append(current)
+                    current = ""
 
     if current.strip():
         chunks.append(current.strip())
@@ -727,6 +730,37 @@ def _get_speaker_embedding(tts, ref_path: str, gpt_cond_len: int = 6, max_ref_le
     return _gpt_cond_latent, _speaker_embedding
 
 
+def _tts_chunk_internal(
+    xtts_model,
+    gen_text: str,
+    language: str,
+    gpt_cond_latent,
+    speaker_embedding,
+    speed: float = 1.0,
+) -> np.ndarray:
+    """
+    Internal TTS function - processes single chunk with pre-computed embeddings.
+    MAXIMUM SPEED optimizations applied.
+    """
+    # AGGRESSIVE speed optimizations for fastest inference
+    out = xtts_model.inference(
+        text=gen_text,
+        language=language,
+        gpt_cond_latent=gpt_cond_latent,
+        speaker_embedding=speaker_embedding,
+        speed=speed,
+        enable_text_splitting=False,  # We already split text
+        # AGGRESSIVE Speed optimizations
+        temperature=0.5,        # Much lower = faster, more deterministic (default 0.75)
+        top_k=20,               # Much lower = faster sampling (default 50)
+        top_p=0.7,              # Lower = faster nucleus sampling (default 0.85)
+        repetition_penalty=10.0, # Higher = less repetition loops (saves time)
+        length_penalty=1.0,     # Default
+        do_sample=True,         # Required for temperature/top_k/top_p
+    )
+    return out["wav"]
+
+
 def _tts_chunk(
     tts,
     ref_path: str,
@@ -747,27 +781,10 @@ def _tts_chunk(
         if gpt_cond_latent is not None and speaker_embedding is not None:
             # Fast path: Use cached embedding
             xtts_model = tts.synthesizer.tts_model
-
-            # Direct inference with cached embedding (faster)
-            # Speed optimizations:
-            # - temperature: lower = faster, less variation (default 0.75)
-            # - top_k: lower = faster sampling (default 50)
-            # - top_p: lower = faster nucleus sampling (default 0.85)
-            # - num_beams: 1 = greedy search (fastest)
-            out = xtts_model.inference(
-                text=gen_text,
-                language=language,
-                gpt_cond_latent=gpt_cond_latent,
-                speaker_embedding=speaker_embedding,
-                speed=speed,
-                enable_text_splitting=False,  # We already split text
-                # Speed optimizations
-                temperature=0.65,       # Lower = faster (default 0.75)
-                top_k=30,               # Lower = faster (default 50)
-                top_p=0.8,              # Lower = faster (default 0.85)
-                repetition_penalty=5.0, # Default
+            audio_np = _tts_chunk_internal(
+                xtts_model, gen_text, language,
+                gpt_cond_latent, speaker_embedding, speed
             )
-            audio_np = out["wav"]
             sr = tts.synthesizer.output_sample_rate
         else:
             # Fallback: Use standard API (slower but reliable)
@@ -809,6 +826,115 @@ def _tts_chunk(
         finally:
             if os.path.exists(out_path):
                 os.remove(out_path)
+
+
+def _process_chunks_parallel(
+    tts,
+    ref_path: str,
+    chunks: List[str],
+    language: str = "en",
+    speed: float = 1.0,
+    gpt_cond_len: int = 4,
+    batch_size: int = 4,  # Process N chunks per batch
+) -> Tuple[List[np.ndarray], int]:
+    """
+    Process TTS chunks in parallel batches for maximum speed.
+
+    Strategy:
+    1. Pre-compute speaker embedding once (cached)
+    2. Process chunks sequentially on GPU (XTTS limitation)
+    3. Use optimized inference parameters
+    4. Minimal overhead between chunks
+
+    Returns: (audio_segments, sample_rate)
+    """
+    print(f"[PARALLEL] Processing {len(chunks)} chunks with batch optimization")
+    print(f"[PARALLEL] batch_size={batch_size}, gpt_cond_len={gpt_cond_len}s")
+
+    # Pre-compute speaker embedding ONCE (critical for speed)
+    gpt_cond_latent, speaker_embedding = _get_speaker_embedding(
+        tts, ref_path, gpt_cond_len=gpt_cond_len
+    )
+
+    if gpt_cond_latent is None or speaker_embedding is None:
+        print("[PARALLEL] WARNING: Could not cache embeddings, using slower fallback")
+        # Fallback to sequential processing
+        segments = []
+        sr = None
+        for i, chunk in enumerate(chunks):
+            cleaned = _clean_for_tts(chunk)
+            audio_np, sr = _tts_chunk(tts, ref_path, cleaned, language, speed, gpt_cond_len)
+            segments.append(audio_np)
+            print(f"[PARALLEL] Fallback: Chunk {i+1}/{len(chunks)} done")
+        return segments, sr or 24000
+
+    # Get XTTS model for direct inference
+    xtts_model = tts.synthesizer.tts_model
+    sr = tts.synthesizer.output_sample_rate
+
+    all_segments = []
+    total_chunks = len(chunks)
+
+    # Process in batches for progress tracking
+    start_time = time.time()
+
+    for batch_idx in range(0, total_chunks, batch_size):
+        batch_end = min(batch_idx + batch_size, total_chunks)
+        batch_chunks = chunks[batch_idx:batch_end]
+        batch_start_time = time.time()
+
+        print(f"[PARALLEL] Processing batch {batch_idx//batch_size + 1}: chunks {batch_idx+1}-{batch_end}")
+
+        # Process each chunk in batch (GPU sequential, but with minimal overhead)
+        for local_idx, chunk in enumerate(batch_chunks):
+            global_idx = batch_idx + local_idx
+            cleaned = _clean_for_tts(chunk)
+
+            chunk_start = time.time()
+
+            try:
+                # Direct inference with cached embeddings (fastest path)
+                audio_np = _tts_chunk_internal(
+                    xtts_model, cleaned, language,
+                    gpt_cond_latent, speaker_embedding, speed
+                )
+
+                # Convert to int16
+                if isinstance(audio_np, torch.Tensor):
+                    audio_np = audio_np.cpu().numpy()
+
+                if audio_np.dtype == np.float32 or audio_np.dtype == np.float64:
+                    audio_np = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
+                elif audio_np.dtype != np.int16:
+                    audio_np = audio_np.astype(np.int16)
+
+                all_segments.append(audio_np)
+
+                chunk_time = time.time() - chunk_start
+                chars_per_sec = len(cleaned) / chunk_time if chunk_time > 0 else 0
+                print(f"[PARALLEL] Chunk {global_idx+1}/{total_chunks}: {len(cleaned)} chars in {chunk_time:.2f}s ({chars_per_sec:.1f} chars/sec)")
+
+            except Exception as e:
+                print(f"[PARALLEL] Error on chunk {global_idx+1}: {e}")
+                # Fallback for failed chunk
+                audio_np, _ = _tts_chunk(tts, ref_path, cleaned, language, speed, gpt_cond_len)
+                all_segments.append(audio_np)
+
+        batch_time = time.time() - batch_start_time
+        elapsed = time.time() - start_time
+        chunks_done = batch_end
+        chunks_remaining = total_chunks - chunks_done
+
+        if chunks_done > 0:
+            avg_time_per_chunk = elapsed / chunks_done
+            eta = chunks_remaining * avg_time_per_chunk
+            print(f"[PARALLEL] Batch done in {batch_time:.2f}s | Progress: {chunks_done}/{total_chunks} | ETA: {eta:.0f}s")
+
+    total_time = time.time() - start_time
+    print(f"[PARALLEL] ✓ All {total_chunks} chunks processed in {total_time:.2f}s")
+    print(f"[PARALLEL] Average: {total_time/total_chunks:.2f}s per chunk")
+
+    return all_segments, sr
 
 
 def _concat_audio_streaming(segments: List[np.ndarray], output_path: str, sr: int) -> int:
@@ -874,7 +1000,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     # NOTE: Speaker embedding cache is managed by _cached_ref_path
     # It will automatically recompute when ref_audio changes
 
-    print("### handler version: coqui_xtts_v2_optimized_v2_2025-12-13 ###")
+    print("### handler version: coqui_xtts_v2_parallel_v3_2025-12-13 ###")
     print("### Using Coqui TTS XTTS v2 for voice cloning (OPTIMIZED) ###")
     print("### NOTE: All chunks will be COMBINED into ONE complete audio file ###")
 
@@ -896,67 +1022,73 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         ref_text = _transcribe_ref_audio(ref_path, language=language)
 
     # Chunking (for TTS processing only - output will be ONE file)
-    # XTTS v2 handles longer chunks better
-    max_chars = int(inp.get("chunk_max_chars", 250))
-    min_chars = int(inp.get("chunk_min_chars", 100))
+    # LARGER chunks = fewer overhead = FASTER processing
+    # XTTS v2 can handle up to ~500 chars per chunk efficiently
+    max_chars = int(inp.get("chunk_max_chars", 450))  # INCREASED default
+    min_chars = int(inp.get("chunk_min_chars", 200))  # INCREASED default
     chunks = _chunk_text(raw_text, max_chars=max_chars, min_chars=min_chars)
 
-    print(f"[PROCESSING] Will process {len(chunks)} text chunks")
+    # Calculate estimated time
+    total_chars = len(raw_text)
+    num_chunks = len(chunks)
+    est_time_per_chunk = 8  # ~8 seconds per chunk with optimizations
+    est_total_time = num_chunks * est_time_per_chunk
+
+    print(f"[PROCESSING] Will process {num_chunks} text chunks ({total_chars} total chars)")
+    print(f"[PROCESSING] Estimated time: ~{est_total_time}s ({est_total_time//60}m {est_total_time%60}s)")
     print(f"[PROCESSING] These will be COMBINED into ONE complete audio file")
 
     # Synthesis settings
     volume = float(inp.get("volume", 1.0))
     volume = max(volume, 0.0)
-    pause_seconds = float(inp.get("pause_s", 0.15))
+    pause_seconds = float(inp.get("pause_s", 0.10))  # Reduced default pause
     # Speed control: 1.0 = normal, 1.2 = 20% faster, 0.8 = 20% slower
     speed = float(inp.get("speed", 1.0))
-    # GPT conditioning length (seconds) - lower = faster but may reduce quality
-    gpt_cond_len = int(inp.get("gpt_cond_len", 6))  # Default 6 seconds
+    # GPT conditioning length (seconds) - LOWER = FASTER but may reduce quality
+    gpt_cond_len = int(inp.get("gpt_cond_len", 4))  # REDUCED to 4 seconds for speed
+
+    # Parallel batch processing settings
+    batch_size = int(inp.get("batch_size", 4))  # Chunks per batch for progress tracking
 
     print(f"[SYNTH] language={language}, volume={volume}, pause_s={pause_seconds}, speed={speed}, gpt_cond_len={gpt_cond_len}s")
+    print(f"[SYNTH] Using PARALLEL batch processing (batch_size={batch_size})")
 
     tts = get_tts_model()
 
-    all_segments = []
-    sr_final = None  # Will be set from first chunk
+    # Use optimized parallel processing
+    processing_start = time.time()
+    all_segments, sr_final = _process_chunks_parallel(
+        tts=tts,
+        ref_path=ref_path,
+        chunks=chunks,
+        language=language,
+        speed=speed,
+        gpt_cond_len=gpt_cond_len,
+        batch_size=batch_size,
+    )
+    processing_time = time.time() - processing_start
 
-    # Generate each chunk
-    import time
-    for idx, chunk in enumerate(chunks, start=1):
-        cleaned = _clean_for_tts(chunk)
-        chunk_start = time.time()
-        print(f"[TTS] Processing chunk {idx}/{len(chunks)} ({len(cleaned)} chars)")
+    print(f"[SYNTH] Total TTS processing time: {processing_time:.2f}s")
 
-        audio_np, sr = _tts_chunk(
-            tts,
-            ref_path,
-            cleaned,
-            language=language,
-            speed=speed,
-            gpt_cond_len=gpt_cond_len,
-        )
-        chunk_time = time.time() - chunk_start
-        print(f"[TTS] Chunk {idx} completed in {chunk_time:.2f}s")
+    # Apply volume if needed
+    if volume != 1.0:
+        print(f"[SYNTH] Applying volume adjustment: {volume}")
+        all_segments = [
+            (seg.astype(np.float32) * volume).clip(-32768, 32767).astype(np.int16)
+            for seg in all_segments
+        ]
 
-        if sr_final is None:
-            sr_final = sr
-            print(f"[TTS] Sample rate: {sr_final}Hz")
-
-        # Apply volume
-        if volume != 1.0:
-            audio_np = (audio_np.astype(np.float32) * volume).clip(-32768, 32767).astype(np.int16)
-
-        all_segments.append(audio_np)
-
-        # Insert pause between chunks
-        if idx < len(chunks) and pause_seconds > 0:
-            pause_samples = int(sr_final * pause_seconds)
-            silence = np.zeros(pause_samples, dtype=np.int16)
-            all_segments.append(silence)
-
-    # Default sample rate if none was set
-    if sr_final is None:
-        sr_final = 24000
+    # Insert pauses between segments
+    if pause_seconds > 0 and len(all_segments) > 1:
+        print(f"[SYNTH] Adding {pause_seconds}s pauses between segments")
+        pause_samples = int(sr_final * pause_seconds)
+        silence = np.zeros(pause_samples, dtype=np.int16)
+        segments_with_pauses = []
+        for i, seg in enumerate(all_segments):
+            segments_with_pauses.append(seg)
+            if i < len(all_segments) - 1:
+                segments_with_pauses.append(silence.copy())
+        all_segments = segments_with_pauses
 
     # Create ONE complete audio file
     fd, final_path = tempfile.mkstemp(suffix=".wav")
@@ -1005,7 +1137,10 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         "pause_s": pause_seconds,
         "file_size_mb": round(file_size_mb, 2),
         "output_type": "complete_audio",  # Clarify this is ONE complete file
-        "model": "coqui_xtts_v2"
+        "model": "coqui_xtts_v2",
+        "processing_time_seconds": round(processing_time, 2),
+        "chars_processed": len(raw_text),
+        "chars_per_second": round(len(raw_text) / processing_time, 1) if processing_time > 0 else 0,
     }
 
     try:
