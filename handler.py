@@ -1069,4 +1069,16 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 # ==============================
 # RunPod Entry
 # ==============================
-runpod.serverless.start({"handler": generate_speech})
+# Pre-load models on worker startup (before receiving jobs)
+# This reduces cold start time significantly
+print("[STARTUP] Pre-loading models...")
+try:
+    get_tts_model()  # Load and cache model globally
+    print("[STARTUP] TTS model pre-loaded successfully")
+except Exception as e:
+    print(f"[STARTUP] Warning: Could not pre-load TTS model: {e}")
+
+runpod.serverless.start({
+    "handler": generate_speech,
+    "return_aggregate_stream": False,  # Don't aggregate streaming responses
+})
