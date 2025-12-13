@@ -54,13 +54,10 @@ def get_tts_model():
         # XTTS v2 - Best voice cloning model from Coqui
         _tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
 
-        # Enable half precision on GPU for 2x speed boost
-        if device == "cuda" and hasattr(_tts_model.synthesizer, 'tts_model'):
-            try:
-                _tts_model.synthesizer.tts_model.half()
-                print("[TTS] Enabled FP16 (half precision) for faster inference")
-            except Exception as e:
-                print(f"[TTS] Could not enable FP16: {e}")
+        # NOTE: FP16 (half precision) is NOT compatible with XTTS v2
+        # The HiFi-GAN decoder and speaker encoder don't support mixed precision
+        # Keeping FP32 for stability
+        print(f"[TTS] Using FP32 (full precision) - XTTS v2 doesn't support FP16")
 
         print(f"[get_tts_model] Loaded XTTS v2 on {device}")
         print("======== END INIT COQUI TTS MODEL ========")
