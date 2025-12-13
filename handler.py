@@ -654,13 +654,13 @@ def _split_into_sentences(text: str) -> List[str]:
 
 def _chunk_text(
     text: str,
-    max_chars: int = 600,  # INCREASED for fewer chunks = faster processing
-    min_chars: int = 100,  # REDUCED to allow better merging
+    max_chars: int = 245,  # XTTS v2 has 250 char limit - stay under it!
+    min_chars: int = 100,  # Allow flexible merging
 ) -> List[str]:
     """
     Split text into chunks for TTS processing.
-    XTTS v2 can handle LONGER chunks - use this for speed!
-    Fewer chunks = less overhead = faster total processing.
+    IMPORTANT: XTTS v2 has a 250 character limit per chunk!
+    Chunks > 250 chars will be truncated and produce incomplete audio.
     NOTE: These chunks are only for TTS processing - final output is ONE combined audio file.
     """
     sentences = _split_into_sentences(text)
@@ -1000,7 +1000,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     # NOTE: Speaker embedding cache is managed by _cached_ref_path
     # It will automatically recompute when ref_audio changes
 
-    print("### handler version: coqui_xtts_v2_parallel_v4_2025-12-14 ###")
+    print("### handler version: coqui_xtts_v2_parallel_v5_2025-12-14 ###")
     print("### Using Coqui TTS XTTS v2 for voice cloning (OPTIMIZED) ###")
     print("### NOTE: All chunks will be COMBINED into ONE complete audio file ###")
 
@@ -1022,10 +1022,10 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         ref_text = _transcribe_ref_audio(ref_path, language=language)
 
     # Chunking (for TTS processing only - output will be ONE file)
-    # LARGER chunks = fewer overhead = FASTER processing
-    # XTTS v2 can handle up to ~600 chars per chunk efficiently
-    max_chars = int(inp.get("chunk_max_chars", 600))  # INCREASED to 600 for speed
-    min_chars = int(inp.get("chunk_min_chars", 100))  # REDUCED to allow better merging
+    # IMPORTANT: XTTS v2 has a 250 character limit per chunk!
+    # Chunks > 250 chars will produce truncated/incomplete audio
+    max_chars = int(inp.get("chunk_max_chars", 245))  # XTTS v2 limit is 250
+    min_chars = int(inp.get("chunk_min_chars", 100))  # Allow flexible merging
     chunks = _chunk_text(raw_text, max_chars=max_chars, min_chars=min_chars)
 
     # Calculate estimated time
