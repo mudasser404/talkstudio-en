@@ -654,8 +654,8 @@ def _split_into_sentences(text: str) -> List[str]:
 
 def _chunk_text(
     text: str,
-    max_chars: int = 400,  # INCREASED for fewer chunks = faster processing
-    min_chars: int = 200,  # INCREASED minimum
+    max_chars: int = 600,  # INCREASED for fewer chunks = faster processing
+    min_chars: int = 100,  # REDUCED to allow better merging
 ) -> List[str]:
     """
     Split text into chunks for TTS processing.
@@ -1000,7 +1000,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     # NOTE: Speaker embedding cache is managed by _cached_ref_path
     # It will automatically recompute when ref_audio changes
 
-    print("### handler version: coqui_xtts_v2_parallel_v3_2025-12-13 ###")
+    print("### handler version: coqui_xtts_v2_parallel_v4_2025-12-14 ###")
     print("### Using Coqui TTS XTTS v2 for voice cloning (OPTIMIZED) ###")
     print("### NOTE: All chunks will be COMBINED into ONE complete audio file ###")
 
@@ -1023,9 +1023,9 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # Chunking (for TTS processing only - output will be ONE file)
     # LARGER chunks = fewer overhead = FASTER processing
-    # XTTS v2 can handle up to ~500 chars per chunk efficiently
-    max_chars = int(inp.get("chunk_max_chars", 450))  # INCREASED default
-    min_chars = int(inp.get("chunk_min_chars", 200))  # INCREASED default
+    # XTTS v2 can handle up to ~600 chars per chunk efficiently
+    max_chars = int(inp.get("chunk_max_chars", 600))  # INCREASED to 600 for speed
+    min_chars = int(inp.get("chunk_min_chars", 100))  # REDUCED to allow better merging
     chunks = _chunk_text(raw_text, max_chars=max_chars, min_chars=min_chars)
 
     # Calculate estimated time
