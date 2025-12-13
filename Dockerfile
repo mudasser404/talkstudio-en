@@ -26,7 +26,12 @@ RUN pip install --upgrade pip \
 # Hugging Face cache directory (Coqui TTS also uses HF for model downloads)
 ENV HF_HOME=/root/.cache/huggingface
 
-# Pre-download XTTS v2 model to speed up first run
+# IMPORTANT: Accept Coqui TTS license by creating the agreement file
+# This bypasses the interactive TOS prompt
+RUN mkdir -p /root/.local/share/tts \
+ && touch /root/.local/share/tts/coqui_tos_agreed.txt
+
+# Pre-download XTTS v2 model (TOS already accepted above)
 RUN python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')" \
   || echo 'Model download will happen at runtime'
 

@@ -13,6 +13,17 @@ from scipy.io import wavfile
 import paramiko
 
 # ==============================
+# Accept Coqui TTS Terms of Service (bypass interactive prompt)
+# ==============================
+TOS_DIR = os.path.expanduser("~/.local/share/tts")
+TOS_FILE = os.path.join(TOS_DIR, "coqui_tos_agreed.txt")
+if not os.path.exists(TOS_FILE):
+    os.makedirs(TOS_DIR, exist_ok=True)
+    with open(TOS_FILE, "w") as f:
+        f.write("I have read and agree to the terms of service.")
+    print(f"[INIT] Created TOS agreement file: {TOS_FILE}")
+
+# ==============================
 # Coqui TTS (XTTS v2) Integration
 # ==============================
 from TTS.api import TTS
