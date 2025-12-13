@@ -14,14 +14,17 @@ import paramiko
 
 # ==============================
 # Accept Coqui TTS Terms of Service (bypass interactive prompt)
+# Must patch BEFORE importing TTS
 # ==============================
-TOS_DIR = os.path.expanduser("~/.local/share/tts")
-TOS_FILE = os.path.join(TOS_DIR, "coqui_tos_agreed.txt")
-if not os.path.exists(TOS_FILE):
-    os.makedirs(TOS_DIR, exist_ok=True)
-    with open(TOS_FILE, "w") as f:
-        f.write("I have read and agree to the terms of service.")
-    print(f"[INIT] Created TOS agreement file: {TOS_FILE}")
+import TTS.utils.manage as tts_manage
+
+# Monkey-patch the ask_tos function to always return True (accept TOS)
+def _patched_ask_tos(self, output_path):
+    """Patched to auto-accept TOS without interactive prompt."""
+    return True
+
+tts_manage.ModelManager.ask_tos = _patched_ask_tos
+print("[INIT] Patched Coqui TTS to auto-accept TOS")
 
 # ==============================
 # Coqui TTS (XTTS v2) Integration
