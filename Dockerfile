@@ -18,7 +18,9 @@ RUN set -x \
 WORKDIR /workspace
 
 # ---- Install Coqui TTS ----
+# IMPORTANT: Pin transformers version compatible with TTS (BeamSearchScorer was removed in newer versions)
 RUN pip install --upgrade pip \
+ && pip install transformers==4.39.3 --no-cache-dir \
  && pip install TTS --no-cache-dir \
  # Extra deps we need: SciPy, RunPod SDK, HTTP client, faster-whisper, boto3 for storage, and paramiko for SFTP
  && pip install scipy requests runpod faster-whisper boto3 paramiko --no-cache-dir
