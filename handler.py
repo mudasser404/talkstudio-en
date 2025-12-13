@@ -13,93 +13,47 @@ from scipy.io import wavfile
 import paramiko
 
 # ==============================
-# Patch F5-TTS to avoid torchaudio/torchcodec
+# Coqui TTS (XTTS v2) Integration
 # ==============================
-def patch_utils_infer() -> None:
-    """
-    Replace torchaudio.load() with SciPy in utils_infer.py to avoid TorchCodec backend errors.
-    """
-    utils_file = Path(__file__).parent / "src" / "f5_tts" / "infer" / "utils_infer.py"
-
-    if not utils_file.exists():
-        print(f"[patch_utils_infer] Warning: {utils_file} not found, skipping patch.")
-        return
-
-    text = utils_file.read_text()
-
-    if "audio, sr = torchaudio.load(ref_audio)" not in text:
-        print("[patch_utils_infer] Already patched or no torchaudio.load() present.")
-        return
-
-    old_line = "    audio, sr = torchaudio.load(ref_audio)"
-
-    new_block = (
-        "    # Load audio with SciPy instead of torchaudio.load to avoid TorchCodec backend\n"
-        "    from scipy.io import wavfile\n"
-        "    import numpy as np\n"
-        "    import torch\n"
-        "\n"
-        "    sr, audio_np = wavfile.read(ref_audio)\n"
-        "\n"
-        "    if np.issubdtype(audio_np.dtype, np.integer):\n"
-        "        max_val = np.iinfo(audio_np.dtype).max\n"
-        "        audio_np = audio_np.astype(np.float32) / max_val\n"
-        "    else:\n"
-        "        audio_np = audio_np.astype(np.float32)\n"
-        "\n"
-        "    if audio_np.ndim == 1:\n"
-        "        audio = torch.from_numpy(audio_np).unsqueeze(0)\n"
-        "    else:\n"
-        "        audio = torch.from_numpy(audio_np.T)\n"
-    )
-
-    text = text.replace(old_line, new_block)
-    utils_file.write_text(text)
-    print("[patch_utils_infer] ✓ utils_infer patched successfully.")
-
-
-# Apply patch BEFORE importing F5TTS
-patch_utils_infer()
-
-from f5_tts.api import F5TTS
-from faster_whisper import WhisperModel
-
+from TTS.api import TTS
 
 # ==============================
 # Global models
 # ==============================
-_f5tts_model: Optional[F5TTS] = None
-_asr_model: Optional[WhisperModel] = None
+_tts_model: Optional[TTS] = None
+_asr_model = None
 
 
-def get_f5tts_model() -> F5TTS:
+def get_tts_model() -> TTS:
     """
-    Load F5TTS_v1_Base once and reuse for all requests.
+    Load Coqui XTTS v2 model once and reuse for all requests.
+    XTTS v2 supports multilingual voice cloning.
     """
-    global _f5tts_model
-    if _f5tts_model is None:
-        print("========== INIT F5TTS MODEL ==========")
-        print("[F5TTS] torch.cuda.is_available():", torch.cuda.is_available())
-        print("[F5TTS] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    global _tts_model
+    if _tts_model is None:
+        print("========== INIT COQUI TTS MODEL ==========")
+        print("[TTS] torch.cuda.is_available():", torch.cuda.is_available())
+        print("[TTS] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
 
-        _f5tts_model = F5TTS(
-            model="F5TTS_v1_Base",
-            hf_cache_dir="/root/.cache/huggingface/hub",
-        )
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        print("[get_f5tts_model] Loaded F5TTS_v1_Base")
-        print("======== END INIT F5TTS MODEL ========")
+        # XTTS v2 - Best voice cloning model from Coqui
+        _tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
 
-    return _f5tts_model
+        print(f"[get_tts_model] Loaded XTTS v2 on {device}")
+        print("======== END INIT COQUI TTS MODEL ========")
+
+    return _tts_model
 
 
-def get_asr_model() -> WhisperModel:
+def get_asr_model():
     """
     ASR MUST run on CPU — GPU Whisper fails on RunPod Serverless (missing cuDNN).
     CPU mode is fast for 3–10 sec reference audio.
     """
     global _asr_model
     if _asr_model is None:
+        from faster_whisper import WhisperModel
         model_name = "large-v3"
 
         print("========== INIT ASR MODEL ==========")
@@ -145,21 +99,21 @@ def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> 
     # Generate unique filename
     import uuid
     from datetime import datetime
-    
+
     timestamp = datetime.utcnow().strftime("%Y/%m/%d")
     unique_id = str(uuid.uuid4())
     filename = f"runpod_{unique_id}.wav"
-    
+
     # Create remote directory path
     remote_dir = os.path.join(remote_path, timestamp)
     remote_file_path = os.path.join(remote_dir, filename)
-    
+
     # Public URL
     public_url = f"{base_url.rstrip('/')}/{timestamp}/{filename}"
 
     ssh = None
     sftp = None
-    
+
     try:
         print(f"[UPLOAD] Connecting to {host}:{port} as {username}...")
         print(f"[UPLOAD] Using password authentication: {bool(password)}")
@@ -168,7 +122,7 @@ def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> 
         # Setup SSH connection with compression
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
+
         # Connect
         connect_kwargs = {
             "hostname": host,
@@ -187,9 +141,9 @@ def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> 
             raise ValueError("Either password or key_file must be provided")
 
         ssh.connect(**connect_kwargs)
-        
+
         print(f"[UPLOAD] Connected successfully")
-        
+
         # Create directory and check
         print(f"[UPLOAD] Creating directory: {remote_dir}")
         stdin, stdout, stderr = ssh.exec_command(f"mkdir -p {remote_dir} && chmod 755 {remote_dir}")
@@ -216,46 +170,46 @@ def _upload_to_vps_streaming(file_path: str, storage_config: Dict[str, Any]) -> 
             print(f"[UPLOAD] Write permission verified")
         except Exception as e:
             raise Exception(f"No write permission in {remote_dir}: {e}")
-        
+
         # Get file size
         file_size = os.path.getsize(file_path)
         file_size_mb = file_size / (1024 * 1024)
-        
+
         print(f"[UPLOAD] Uploading COMPLETE audio file: {file_size_mb:.2f}MB")
         print(f"[UPLOAD] This is the FINAL combined audio, not chunks")
-        
+
         # Stream upload
         CHUNK_SIZE = 32768  # 32KB chunks for network transfer
         uploaded_bytes = 0
-        
+
         with sftp.open(remote_file_path, 'wb') as remote_file:
             with open(file_path, 'rb') as local_file:
                 while True:
                     chunk = local_file.read(CHUNK_SIZE)
                     if not chunk:
                         break
-                    
+
                     remote_file.write(chunk)
                     uploaded_bytes += len(chunk)
-                    
+
                     # Progress every 5MB
                     if uploaded_bytes % (5 * 1024 * 1024) < CHUNK_SIZE:
                         progress = (uploaded_bytes / file_size) * 100
                         print(f"[UPLOAD] Progress: {progress:.1f}% ({uploaded_bytes / (1024*1024):.2f}MB / {file_size_mb:.2f}MB)")
-        
+
         print(f"[UPLOAD] ✓ Complete audio uploaded: {file_size_mb:.2f}MB")
-        
+
         # Set permissions
         sftp.chmod(remote_file_path, 0o644)
-        
+
         # Close connections
         sftp.close()
         ssh.close()
-        
+
         print(f"[UPLOAD] ✓ File accessible at: {public_url}")
-        
+
         return public_url
-        
+
     except Exception as e:
         print(f"[UPLOAD] ✗ Upload failed: {e}")
         print(f"[UPLOAD] Error type: {type(e).__name__}")
@@ -680,11 +634,12 @@ def _split_into_sentences(text: str) -> List[str]:
 
 def _chunk_text(
     text: str,
-    max_chars: int = 200,
-    min_chars: int = 80,
+    max_chars: int = 250,
+    min_chars: int = 100,
 ) -> List[str]:
     """
     Split text into chunks for TTS processing.
+    XTTS v2 can handle longer chunks than F5-TTS.
     NOTE: These chunks are only for TTS processing - final output is ONE combined audio file.
     """
     sentences = _split_into_sentences(text)
@@ -713,38 +668,39 @@ def _chunk_text(
 
 
 # ==============================
-# TTS
+# TTS with Coqui XTTS v2
 # ==============================
 def _tts_chunk(
-    api: F5TTS,
+    tts: TTS,
     ref_path: str,
-    ref_text: str,
     gen_text: str,
-    speed: float,
-    remove_silence: bool,
-    nfe_step: int,
-    target_rms: float,
+    language: str = "en",
 ) -> np.ndarray:
-
+    """
+    Generate speech for a text chunk using Coqui XTTS v2.
+    Returns int16 numpy array.
+    """
     fd, out_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
 
     try:
-        _, sr, _ = api.infer(
-            ref_file=ref_path,
-            ref_text=ref_text,
-            gen_text=gen_text,
-            speed=speed,
-            remove_silence=remove_silence,
-            nfe_step=nfe_step,
-            target_rms=target_rms,
-            file_wave=out_path,
-            file_spec=None,
+        # XTTS v2 voice cloning synthesis
+        tts.tts_to_file(
+            text=gen_text,
+            speaker_wav=ref_path,
+            language=language,
+            file_path=out_path,
         )
 
         sr_read, audio_np = wavfile.read(out_path)
-        assert sr_read == sr
-        return audio_np.astype(np.int16)
+
+        # Convert to int16 if needed
+        if audio_np.dtype == np.float32 or audio_np.dtype == np.float64:
+            audio_np = (audio_np * 32767).astype(np.int16)
+        elif audio_np.dtype != np.int16:
+            audio_np = audio_np.astype(np.int16)
+
+        return audio_np, sr_read
 
     finally:
         if os.path.exists(out_path):
@@ -758,22 +714,22 @@ def _concat_audio_streaming(segments: List[np.ndarray], output_path: str, sr: in
     Memory-efficient: writes directly to disk.
     """
     import struct
-    
+
     print(f"[COMBINE] Merging {len(segments)} audio segments into ONE complete file...")
-    
+
     # Calculate total samples
     total_samples = sum(len(seg) for seg in segments)
     total_duration = total_samples / sr
-    
+
     print(f"[COMBINE] Total duration: {total_duration:.2f} seconds")
-    
+
     # Write WAV file
     with open(output_path, 'wb') as f:
         # WAV header
         f.write(b'RIFF')
         f.write(struct.pack('<I', 0))  # Placeholder
         f.write(b'WAVE')
-        
+
         # Format chunk
         f.write(b'fmt ')
         f.write(struct.pack('<I', 16))
@@ -783,27 +739,27 @@ def _concat_audio_streaming(segments: List[np.ndarray], output_path: str, sr: in
         f.write(struct.pack('<I', sr * 2))
         f.write(struct.pack('<H', 2))
         f.write(struct.pack('<H', 16))
-        
+
         # Data chunk
         f.write(b'data')
         data_size = total_samples * 2
         f.write(struct.pack('<I', data_size))
-        
+
         # Write all segments
         for i, segment in enumerate(segments):
             segment.tofile(f)
             del segment
-            
+
             if (i + 1) % 10 == 0:
                 print(f"[COMBINE] Progress: {i + 1}/{len(segments)} segments merged")
-        
+
         # Update file size
         file_size = f.tell()
         f.seek(4)
         f.write(struct.pack('<I', file_size - 8))
-    
+
     print(f"[COMBINE] ✓ Complete audio file created: {file_size / (1024*1024):.2f}MB")
-    
+
     return file_size
 
 
@@ -812,7 +768,8 @@ def _concat_audio_streaming(segments: List[np.ndarray], output_path: str, sr: in
 # ==============================
 def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
-    print("### handler version: f5tts_complete_audio_2025-12-09 ###")
+    print("### handler version: coqui_xtts_v2_2025-12-13 ###")
+    print("### Using Coqui TTS XTTS v2 for voice cloning ###")
     print("### NOTE: All chunks will be COMBINED into ONE complete audio file ###")
 
     inp = job.get("input", {})
@@ -822,52 +779,56 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 
     ref_path = _get_ref_audio_path(inp)
 
-    # Reference text
+    # Language for XTTS v2 (supports: en, es, fr, de, it, pt, pl, tr, ru, nl, cs, ar, zh-cn, ja, hu, ko)
+    language = inp.get("language", "en")
+    print(f"[INPUT] language: {language}")
+
+    # Reference text (optional for XTTS - it doesn't need transcription)
     ref_text = (inp.get("ref_text") or "").strip()
     if not ref_text:
-        ref_text = _transcribe_ref_audio(ref_path, language=inp.get("language"))
+        # Still transcribe for logging/debugging purposes
+        ref_text = _transcribe_ref_audio(ref_path, language=language)
 
     # Chunking (for TTS processing only - output will be ONE file)
-    max_chars = int(inp.get("chunk_max_chars", 150))
-    min_chars = int(inp.get("chunk_min_chars", 50))
+    # XTTS v2 handles longer chunks better
+    max_chars = int(inp.get("chunk_max_chars", 250))
+    min_chars = int(inp.get("chunk_min_chars", 100))
     chunks = _chunk_text(raw_text, max_chars=max_chars, min_chars=min_chars)
 
     print(f"[PROCESSING] Will process {len(chunks)} text chunks")
     print(f"[PROCESSING] These will be COMBINED into ONE complete audio file")
 
     # Synthesis settings
-    # Higher default speed to reduce file size for long texts
-    speed = float(inp.get("speed", 1.0))  # Changed from 0.7 to 1.0 for faster/smaller files
-    remove_silence = bool(inp.get("remove_silence", True))  # Enable by default to reduce size
-    quality = (inp.get("quality") or "standard").lower()
-    nfe_step = 64 if quality == "premium" else 32
     volume = float(inp.get("volume", 1.0))
     volume = max(volume, 0.0)
-    target_rms = 0.1 * volume
-    pause_seconds = float(inp.get("pause_s", 0.12))
+    pause_seconds = float(inp.get("pause_s", 0.15))
 
-    print(f"[SYNTH] speed={speed}, quality={quality}, nfe_step={nfe_step}, volume={volume}, pause_s={pause_seconds}")
+    print(f"[SYNTH] language={language}, volume={volume}, pause_s={pause_seconds}")
 
-    api = get_f5tts_model()
+    tts = get_tts_model()
 
     all_segments = []
-    sr_final = 24000
+    sr_final = None  # Will be set from first chunk
 
     # Generate each chunk
     for idx, chunk in enumerate(chunks, start=1):
         cleaned = _clean_for_tts(chunk)
         print(f"[TTS] Processing chunk {idx}/{len(chunks)} ({len(cleaned)} chars)")
 
-        audio_np = _tts_chunk(
-            api,
+        audio_np, sr = _tts_chunk(
+            tts,
             ref_path,
-            ref_text,
             cleaned,
-            speed,
-            remove_silence,
-            nfe_step,
-            target_rms,
+            language=language,
         )
+
+        if sr_final is None:
+            sr_final = sr
+            print(f"[TTS] Sample rate: {sr_final}Hz")
+
+        # Apply volume
+        if volume != 1.0:
+            audio_np = (audio_np.astype(np.float32) * volume).clip(-32768, 32767).astype(np.int16)
 
         all_segments.append(audio_np)
 
@@ -877,16 +838,20 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             silence = np.zeros(pause_samples, dtype=np.int16)
             all_segments.append(silence)
 
+    # Default sample rate if none was set
+    if sr_final is None:
+        sr_final = 24000
+
     # Create ONE complete audio file
     fd, final_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
 
     print("[FINAL] Creating complete combined audio file...")
     file_size = _concat_audio_streaming(all_segments, final_path, sr_final)
-    
+
     # Clear memory
     del all_segments
-    
+
     file_size_mb = file_size / (1024 * 1024)
     print(f"[FINAL] Complete audio ready: {file_size_mb:.2f}MB")
 
@@ -919,11 +884,12 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         "sample_rate": sr_final,
         "ref_text_used": ref_text,
         "num_chunks_processed": len(chunks),
-        "quality": quality,
+        "language": language,
         "volume": volume,
         "pause_s": pause_seconds,
         "file_size_mb": round(file_size_mb, 2),
-        "output_type": "complete_audio"  # Clarify this is ONE complete file
+        "output_type": "complete_audio",  # Clarify this is ONE complete file
+        "model": "coqui_xtts_v2"
     }
 
     try:
@@ -948,7 +914,7 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             # Base64 for small files
             # TEMPORARY: Increased to 80MB while upload endpoint is being fixed
             max_base64_mb = 80.0
-            
+
             if file_size_mb > max_base64_mb:
                 error_msg = (
                     f"File too large ({file_size_mb:.2f}MB) for base64 response. "
@@ -961,11 +927,11 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             print(f"[OUTPUT] Encoding complete audio as base64...")
             with open(final_path, "rb") as f:
                 audio_bytes = f.read()
-            
+
             base64_str = base64.b64encode(audio_bytes).decode("utf-8")
             result["audio_base64"] = base64_str
             result["uploaded"] = False
-            
+
             print(f"[OUTPUT] ✓ Complete audio encoded as base64")
 
     finally:
@@ -973,9 +939,11 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
         if os.path.exists(final_path):
             os.remove(final_path)
             print("[CLEANUP] Temp files removed")
+        if os.path.exists(ref_path):
+            os.remove(ref_path)
 
     print("[SUCCESS] ONE complete audio file generated and delivered!")
-    
+
     return result
 
 
@@ -983,7 +951,3 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
 # RunPod Entry
 # ==============================
 runpod.serverless.start({"handler": generate_speech})
-   
-
-
-
