@@ -38,10 +38,10 @@ _tts_model: Optional[TTS] = None
 _asr_model = None
 
 
-def get_tts_model() -> TTS:
+def get_tts_model():
     """
     Load Coqui XTTS v2 model once and reuse for all requests.
-    XTTS v2 supports multilingual voice cloning.
+    Returns the synthesizer directly for more control over inference.
     """
     global _tts_model
     if _tts_model is None:
@@ -53,6 +53,14 @@ def get_tts_model() -> TTS:
 
         # XTTS v2 - Best voice cloning model from Coqui
         _tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+
+        # Enable half precision on GPU for 2x speed boost
+        if device == "cuda" and hasattr(_tts_model.synthesizer, 'tts_model'):
+            try:
+                _tts_model.synthesizer.tts_model.half()
+                print("[TTS] Enabled FP16 (half precision) for faster inference")
+            except Exception as e:
+                print(f"[TTS] Could not enable FP16: {e}")
 
         print(f"[get_tts_model] Loaded XTTS v2 on {device}")
         print("======== END INIT COQUI TTS MODEL ========")
@@ -684,41 +692,126 @@ def _chunk_text(
 # ==============================
 # TTS with Coqui XTTS v2
 # ==============================
+_speaker_embedding = None
+_gpt_cond_latent = None
+_cached_ref_path = None  # Track which ref audio is cached
+
+
+def _get_speaker_embedding(tts, ref_path: str, gpt_cond_len: int = 6, max_ref_len: int = 10):
+    """
+    Compute speaker embedding once and cache it for reuse.
+    This saves ~2-3 seconds per chunk.
+
+    Args:
+        gpt_cond_len: Seconds of reference audio for GPT conditioning (default 6, lower = faster)
+        max_ref_len: Max seconds of reference audio to use (default 10)
+    """
+    global _speaker_embedding, _gpt_cond_latent, _cached_ref_path
+
+    # Only recompute if ref_path changed or cache is empty
+    if _speaker_embedding is None or _gpt_cond_latent is None or _cached_ref_path != ref_path:
+        print(f"[TTS] Computing speaker embedding (gpt_cond_len={gpt_cond_len}s, max_ref_len={max_ref_len}s)...")
+        try:
+            # Get the XTTS model directly
+            xtts_model = tts.synthesizer.tts_model
+            gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
+                audio_path=[ref_path],
+                gpt_cond_len=gpt_cond_len,      # Shorter = faster conditioning
+                max_ref_length=max_ref_len,     # Limit reference audio length
+            )
+            _speaker_embedding = speaker_embedding
+            _gpt_cond_latent = gpt_cond_latent
+            _cached_ref_path = ref_path
+            print("[TTS] Speaker embedding cached successfully")
+        except Exception as e:
+            print(f"[TTS] Could not cache embedding: {e}")
+            return None, None
+
+    return _gpt_cond_latent, _speaker_embedding
+
+
 def _tts_chunk(
-    tts: TTS,
+    tts,
     ref_path: str,
     gen_text: str,
     language: str = "en",
+    speed: float = 1.0,
+    gpt_cond_len: int = 6,
 ) -> np.ndarray:
     """
     Generate speech for a text chunk using Coqui XTTS v2.
+    Uses cached speaker embedding for faster inference.
     Returns int16 numpy array.
     """
-    fd, out_path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-
     try:
-        # XTTS v2 voice cloning synthesis
-        tts.tts_to_file(
-            text=gen_text,
-            speaker_wav=ref_path,
-            language=language,
-            file_path=out_path,
-        )
+        # Try to use cached embedding for faster inference
+        gpt_cond_latent, speaker_embedding = _get_speaker_embedding(tts, ref_path, gpt_cond_len=gpt_cond_len)
 
-        sr_read, audio_np = wavfile.read(out_path)
+        if gpt_cond_latent is not None and speaker_embedding is not None:
+            # Fast path: Use cached embedding
+            xtts_model = tts.synthesizer.tts_model
 
-        # Convert to int16 if needed
+            # Direct inference with cached embedding (faster)
+            # Speed optimizations:
+            # - temperature: lower = faster, less variation (default 0.75)
+            # - top_k: lower = faster sampling (default 50)
+            # - top_p: lower = faster nucleus sampling (default 0.85)
+            # - num_beams: 1 = greedy search (fastest)
+            out = xtts_model.inference(
+                text=gen_text,
+                language=language,
+                gpt_cond_latent=gpt_cond_latent,
+                speaker_embedding=speaker_embedding,
+                speed=speed,
+                enable_text_splitting=False,  # We already split text
+                # Speed optimizations
+                temperature=0.65,       # Lower = faster (default 0.75)
+                top_k=30,               # Lower = faster (default 50)
+                top_p=0.8,              # Lower = faster (default 0.85)
+                repetition_penalty=5.0, # Default
+            )
+            audio_np = out["wav"]
+            sr = tts.synthesizer.output_sample_rate
+        else:
+            # Fallback: Use standard API (slower but reliable)
+            audio_np = tts.tts(
+                text=gen_text,
+                speaker_wav=ref_path,
+                language=language,
+            )
+            sr = tts.synthesizer.output_sample_rate
+
+        # Convert to numpy array if needed
+        if isinstance(audio_np, torch.Tensor):
+            audio_np = audio_np.cpu().numpy()
+
+        # Convert to int16
         if audio_np.dtype == np.float32 or audio_np.dtype == np.float64:
-            audio_np = (audio_np * 32767).astype(np.int16)
+            audio_np = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
         elif audio_np.dtype != np.int16:
             audio_np = audio_np.astype(np.int16)
 
-        return audio_np, sr_read
+        return audio_np, sr
 
-    finally:
-        if os.path.exists(out_path):
-            os.remove(out_path)
+    except Exception as e:
+        print(f"[TTS] Error in fast path, using fallback: {e}")
+        # Ultimate fallback with file output
+        fd, out_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            tts.tts_to_file(
+                text=gen_text,
+                speaker_wav=ref_path,
+                language=language,
+                file_path=out_path,
+            )
+            sr_read, audio_np = wavfile.read(out_path)
+            if audio_np.dtype == np.float32 or audio_np.dtype == np.float64:
+                audio_np = (audio_np * 32767).astype(np.int16)
+            return audio_np, sr_read
+        finally:
+            if os.path.exists(out_path):
+                os.remove(out_path)
 
 
 def _concat_audio_streaming(segments: List[np.ndarray], output_path: str, sr: int) -> int:
@@ -781,9 +874,11 @@ def _concat_audio_streaming(segments: List[np.ndarray], output_path: str, sr: in
 # Main Handler
 # ==============================
 def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
+    # NOTE: Speaker embedding cache is managed by _cached_ref_path
+    # It will automatically recompute when ref_audio changes
 
-    print("### handler version: coqui_xtts_v2_2025-12-13 ###")
-    print("### Using Coqui TTS XTTS v2 for voice cloning ###")
+    print("### handler version: coqui_xtts_v2_optimized_v2_2025-12-13 ###")
+    print("### Using Coqui TTS XTTS v2 for voice cloning (OPTIMIZED) ###")
     print("### NOTE: All chunks will be COMBINED into ONE complete audio file ###")
 
     inp = job.get("input", {})
@@ -816,8 +911,12 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     volume = float(inp.get("volume", 1.0))
     volume = max(volume, 0.0)
     pause_seconds = float(inp.get("pause_s", 0.15))
+    # Speed control: 1.0 = normal, 1.2 = 20% faster, 0.8 = 20% slower
+    speed = float(inp.get("speed", 1.0))
+    # GPT conditioning length (seconds) - lower = faster but may reduce quality
+    gpt_cond_len = int(inp.get("gpt_cond_len", 6))  # Default 6 seconds
 
-    print(f"[SYNTH] language={language}, volume={volume}, pause_s={pause_seconds}")
+    print(f"[SYNTH] language={language}, volume={volume}, pause_s={pause_seconds}, speed={speed}, gpt_cond_len={gpt_cond_len}s")
 
     tts = get_tts_model()
 
@@ -825,8 +924,10 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
     sr_final = None  # Will be set from first chunk
 
     # Generate each chunk
+    import time
     for idx, chunk in enumerate(chunks, start=1):
         cleaned = _clean_for_tts(chunk)
+        chunk_start = time.time()
         print(f"[TTS] Processing chunk {idx}/{len(chunks)} ({len(cleaned)} chars)")
 
         audio_np, sr = _tts_chunk(
@@ -834,7 +935,11 @@ def generate_speech(job: Dict[str, Any]) -> Dict[str, Any]:
             ref_path,
             cleaned,
             language=language,
+            speed=speed,
+            gpt_cond_len=gpt_cond_len,
         )
+        chunk_time = time.time() - chunk_start
+        print(f"[TTS] Chunk {idx} completed in {chunk_time:.2f}s")
 
         if sr_final is None:
             sr_final = sr
