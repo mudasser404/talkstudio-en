@@ -9,7 +9,6 @@ ENV PIP_NO_CACHE_DIR=1
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     git \
-    wget \
     ffmpeg \
     libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
@@ -26,21 +25,19 @@ RUN pip install torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/c
 # Install RunPod
 RUN pip install runpod
 
-# Install Coqui TTS (XTTS-v2) with correct transformers version
+# Install Coqui TTS with correct transformers version
 RUN pip install transformers==4.39.3
 RUN pip install TTS
 
-# Accept Coqui TTS TOS
-RUN mkdir -p /root/.local/share/tts && touch /root/.local/share/tts/coqui_tos_agreed.txt
+# Accept Coqui TTS TOS BEFORE downloading model
+RUN mkdir -p /root/.local/share/tts && \
+    echo "agreed" > /root/.local/share/tts/coqui_tos_agreed.txt
 
-# Pre-download XTTS-v2 model (saves cold start time)
-RUN python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')"
+# Pre-download XTTS-v2 model with TOS bypass
+RUN python -c "import os; os.makedirs('/root/.local/share/tts', exist_ok=True); open('/root/.local/share/tts/coqui_tos_agreed.txt', 'w').write('agreed'); from TTS.utils.manage import ModelManager; m = ModelManager(); setattr(m, 'ask_tos', lambda *a: True); from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')"
 
 # Copy handler
 COPY handler.py .
-
-# RunPod specific
-ENV RUNPOD_DEBUG_LEVEL=DEBUG
 
 # Start handler
 CMD ["python", "-u", "handler.py"]
