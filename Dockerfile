@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ffmpeg \
     libsndfile1 \
+    sox \
+    libsox-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
