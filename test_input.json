@@ -1,0 +1,8 @@
+{
+    "input": {
+        "model": "xtts",
+        "text": "Hello, this is a test of voice cloning. The system will clone the reference voice and speak this text.",
+        "reference_audio": "BASE64_ENCODED_AUDIO_HERE",
+        "language": "en"
+    }
+}

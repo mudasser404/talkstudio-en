@@ -1,49 +1,74 @@
-FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
+# RunPod Serverless Dockerfile for Speaker Embedding Voice Cloning
+# Supports: OpenVoice, XTTS-v2, Kokoro-82M
 
-USER root
-ARG DEBIAN_FRONTEND=noninteractive
-LABEL github_repo="https://github.com/coqui-ai/TTS"
+FROM nvidia/cuda:11.8-cudnn8-runtime-ubuntu22.04
 
-# ---- System deps (including ffmpeg & audio libs) ----
-RUN set -x \
- && apt-get update \
- && apt-get -y install \
-      wget curl man git less openssl libssl-dev unzip unar build-essential aria2 tmux vim \
-      openssh-server sox libsox-fmt-all libsox-fmt-mp3 libsndfile1-dev ffmpeg \
-      librdmacm1 libibumad3 librdmacm-dev libibverbs1 libibverbs-dev ibverbs-utils ibverbs-providers \
-      espeak-ng \
- && rm -rf /var/lib/apt/lists/* \
- && apt-get clean
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
 
-WORKDIR /workspace
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3.10-venv \
+    git \
+    wget \
+    curl \
+    ffmpeg \
+    libsndfile1 \
+    libsox-dev \
+    sox \
+    && rm -rf /var/lib/apt/lists/*
 
-# ---- Install Coqui TTS ----
-# IMPORTANT: Pin transformers version compatible with TTS (BeamSearchScorer was removed in newer versions)
-RUN pip install --upgrade pip \
- && pip install transformers==4.39.3 --no-cache-dir \
- && pip install TTS --no-cache-dir \
- # Extra deps we need: SciPy, RunPod SDK, HTTP client, faster-whisper, boto3 for storage, and paramiko for SFTP
- && pip install scipy requests runpod faster-whisper boto3 paramiko --no-cache-dir
+# Set Python 3.10 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1
+RUN update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
 
-# Hugging Face cache directory (Coqui TTS also uses HF for model downloads)
-ENV HF_HOME=/root/.cache/huggingface
+# Upgrade pip
+RUN pip install --upgrade pip setuptools wheel
 
-# IMPORTANT: Accept Coqui TTS license by creating the agreement file
-# This bypasses the interactive TOS prompt
-RUN mkdir -p /root/.local/share/tts \
- && touch /root/.local/share/tts/coqui_tos_agreed.txt
+# Set working directory
+WORKDIR /app
 
-# Pre-download XTTS v2 model (TOS already accepted above)
-RUN python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')" \
-  || echo 'Model download will happen at runtime'
+# Copy requirements first for caching
+COPY requirements.txt .
 
-VOLUME /root/.cache/huggingface/hub/
+# Install PyTorch with CUDA
+RUN pip install torch==2.1.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
 
-# ---- Serverless worker setup ----
-WORKDIR /workspace
+# Install requirements
+RUN pip install -r requirements.txt
+
+# Install TTS models
+# 1. Coqui TTS (XTTS-v2)
+RUN pip install TTS
+
+# 2. OpenVoice
+RUN pip install git+https://github.com/myshell-ai/OpenVoice.git
+RUN pip install git+https://github.com/myshell-ai/MeloTTS.git
+
+# 3. Kokoro-82M
+RUN pip install kokoro>=0.3.4 soundfile
+
+# Download model checkpoints
+RUN mkdir -p /app/checkpoints_v2
+
+# Download OpenVoice V2 checkpoints
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='myshell-ai/OpenVoiceV2', local_dir='/app/checkpoints_v2')"
+
+# Pre-download XTTS-v2 model
+RUN python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')"
+
+# Pre-download Kokoro model
+RUN python -c "from kokoro import KPipeline; KPipeline(lang_code='a')"
 
 # Copy handler
-COPY handler.py /workspace/handler.py
+COPY handler.py .
+COPY test_input.json .
 
-# Default command for RunPod Serverless
+# RunPod specific
+ENV RUNPOD_DEBUG_LEVEL=DEBUG
+
+# Start handler
 CMD ["python", "-u", "handler.py"]

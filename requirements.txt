@@ -1,0 +1,32 @@
+# RunPod Voice Cloning Requirements
+# Core
+runpod>=1.6.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Audio processing
+soundfile>=0.12.1
+librosa>=0.10.1
+pydub>=0.25.1
+audioread>=3.0.0
+
+# PyTorch (installed separately in Dockerfile)
+# torch>=2.1.0
+# torchaudio>=2.1.0
+
+# TTS Models (installed separately in Dockerfile)
+# TTS  # Coqui TTS for XTTS-v2
+# kokoro>=0.3.4  # Kokoro-82M
+
+# HuggingFace
+huggingface_hub>=0.19.0
+transformers>=4.35.0
+safetensors>=0.4.0
+
+# Utilities
+tqdm>=4.66.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Audio encoding
+base64io>=1.0.3
