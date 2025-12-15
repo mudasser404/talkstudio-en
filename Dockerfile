@@ -28,8 +28,8 @@ RUN pip install runpod soundfile pydub requests huggingface_hub numpy
 # Install audio processing
 RUN pip install librosa
 
-# Install MeloTTS first (it has fewer conflicts)
-RUN pip install melotts
+# Install MeloTTS from GitHub
+RUN pip install git+https://github.com/myshell-ai/MeloTTS.git
 RUN python -m unidic download
 
 # Install OpenVoice dependencies
