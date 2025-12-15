@@ -1,6 +1,7 @@
 """
 RunPod Serverless Handler for Chatterbox TTS
 Zero-shot voice cloning with high quality
+GitHub: https://github.com/resemble-ai/chatterbox
 """
 
 import runpod
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL = None
 
+
 # ==============================
 # Model Loading
 # ==============================
@@ -35,10 +37,10 @@ def load_model():
         logger.info(f"CUDA available: {torch.cuda.is_available()}")
         logger.info(f"Device: {DEVICE}")
 
-        from chatterbox.tts_turbo import ChatterboxTurboTTS
-        MODEL = ChatterboxTurboTTS.from_pretrained(device=DEVICE)
+        from chatterbox.tts import ChatterboxTTS
+        MODEL = ChatterboxTTS.from_pretrained(device=DEVICE)
 
-        logger.info("Chatterbox Turbo loaded successfully")
+        logger.info("Chatterbox loaded successfully")
         logger.info("============================================")
 
     return MODEL
@@ -61,8 +63,13 @@ def handler(job):
             "cfg_weight": 0.5
         }
     }
+
+    Special tags you can use in text:
+    - [laugh]
+    - [chuckle]
+    - [cough]
     """
-    logger.info("### handler version: chatterbox_turbo_2025-12-16 ###")
+    logger.info("### handler version: chatterbox_2025-12-16 ###")
 
     try:
         job_input = job.get("input", {})
@@ -81,7 +88,9 @@ def handler(job):
             return {"error": "Text is required"}
 
         logger.info(f"Text length: {len(text)} chars")
+        logger.info(f"Text: {text[:100]}...")
         logger.info(f"Exaggeration: {exaggeration}, CFG Weight: {cfg_weight}")
+        logger.info(f"Has reference audio: {bool(ref_audio_url or ref_audio_base64)}")
 
         # Load model
         model = load_model()
@@ -102,9 +111,11 @@ def handler(job):
                         resp.raise_for_status()
                         f.write(resp.content)
                     ref_path = f.name
+                logger.info(f"Reference audio saved to: {ref_path}")
 
             # Generate audio
             logger.info("Generating audio...")
+
             if ref_path:
                 wav = model.generate(
                     text,
@@ -119,6 +130,8 @@ def handler(job):
                     cfg_weight=cfg_weight
                 )
 
+            logger.info(f"Generated wav shape: {wav.shape}")
+
             # Save to buffer
             buffer = io.BytesIO()
             ta.save(buffer, wav, model.sr, format="wav")
@@ -127,6 +140,7 @@ def handler(job):
             processing_time = time.time() - start_time
             logger.info(f"Processing time: {processing_time:.2f}s")
             logger.info(f"Audio size: {len(audio_bytes) / 1024:.2f}KB")
+            logger.info(f"Sample rate: {model.sr}")
 
             # Encode as base64
             audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
@@ -136,7 +150,8 @@ def handler(job):
                 "status": "success",
                 "processing_time_seconds": round(processing_time, 2),
                 "chars_processed": len(text),
-                "model": "chatterbox_turbo"
+                "sample_rate": model.sr,
+                "model": "chatterbox"
             }
 
         finally:
@@ -152,7 +167,7 @@ def handler(job):
 
 
 # Pre-load model on startup
-logger.info("Pre-loading Chatterbox Turbo model...")
+logger.info("Pre-loading Chatterbox model...")
 try:
     load_model()
     logger.info("Model pre-loaded successfully")
