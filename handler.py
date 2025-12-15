@@ -1,178 +1,97 @@
-"""
-RunPod Serverless Handler for Chatterbox TTS
-Zero-shot voice cloning with high quality
-GitHub: https://github.com/resemble-ai/chatterbox
-"""
-
 import runpod
-import base64
-import os
-import time
-import tempfile
-import requests
-import logging
-import io
-
 import torch
-import torchaudio as ta
+import torchaudio
+import base64
+import io
+import os
+import tempfile
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Global model variable
+model = None
 
-# ==============================
-# Global Settings
-# ==============================
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL = None
-
-
-# ==============================
-# Model Loading
-# ==============================
 def load_model():
-    """Load Chatterbox Turbo model"""
-    global MODEL
-    if MODEL is None:
-        logger.info("========== LOADING Chatterbox Turbo ==========")
-        logger.info(f"CUDA available: {torch.cuda.is_available()}")
-        logger.info(f"Device: {DEVICE}")
-
+    """Load the Chatterbox TTS model."""
+    global model
+    if model is None:
         from chatterbox.tts import ChatterboxTTS
-        MODEL = ChatterboxTTS.from_pretrained(device=DEVICE)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = ChatterboxTTS.from_pretrained(device=device)
+        print(f"Chatterbox model loaded on {device}")
+    return model
 
-        logger.info("Chatterbox loaded successfully")
-        logger.info("============================================")
-
-    return MODEL
-
-
-# ==============================
-# RunPod Handler
-# ==============================
 def handler(job):
     """
-    RunPod handler for Chatterbox TTS
+    RunPod serverless handler for Chatterbox TTS.
 
-    Input format:
-    {
-        "input": {
-            "text": "Text to synthesize",
-            "ref_audio_url": "URL to reference audio (optional)",
-            "ref_audio_base64": "OR base64 encoded audio (optional)",
-            "exaggeration": 0.5,
-            "cfg_weight": 0.5
-        }
-    }
+    Input:
+        - text: Text to synthesize (required)
+        - audio_prompt: Base64 encoded audio file for voice cloning (optional)
+        - exaggeration: Exaggeration factor 0.0-1.0 (default: 0.5)
+        - cfg_weight: CFG weight for generation (default: 0.5)
 
-    Special tags you can use in text:
-    - [laugh]
-    - [chuckle]
-    - [cough]
+    Output:
+        - audio: Base64 encoded WAV audio
+        - sample_rate: Sample rate of the output audio
     """
-    logger.info("### handler version: chatterbox_2025-12-16 ###")
+    job_input = job["input"]
+
+    # Get input parameters
+    text = job_input.get("text")
+    if not text:
+        return {"error": "Text is required"}
+
+    audio_prompt_b64 = job_input.get("audio_prompt")
+    exaggeration = job_input.get("exaggeration", 0.5)
+    cfg_weight = job_input.get("cfg_weight", 0.5)
 
     try:
-        job_input = job.get("input", {})
-
-        # Required
-        text = job_input.get("text", "").strip()
-
-        # Optional
-        ref_audio_url = job_input.get("ref_audio_url")
-        ref_audio_base64 = job_input.get("ref_audio_base64")
-        exaggeration = float(job_input.get("exaggeration", 0.5))
-        cfg_weight = float(job_input.get("cfg_weight", 0.5))
-
-        # Validation
-        if not text:
-            return {"error": "Text is required"}
-
-        logger.info(f"Text length: {len(text)} chars")
-        logger.info(f"Text: {text[:100]}...")
-        logger.info(f"Exaggeration: {exaggeration}, CFG Weight: {cfg_weight}")
-        logger.info(f"Has reference audio: {bool(ref_audio_url or ref_audio_base64)}")
-
         # Load model
-        model = load_model()
+        tts_model = load_model()
 
-        start_time = time.time()
-        ref_path = None
+        # Handle audio prompt for voice cloning
+        audio_prompt_path = None
+        temp_file = None
 
-        try:
-            # Download/decode reference audio if provided
-            if ref_audio_url or ref_audio_base64:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    if ref_audio_base64:
-                        logger.info("Using base64 reference audio")
-                        f.write(base64.b64decode(ref_audio_base64))
-                    else:
-                        logger.info(f"Downloading reference audio: {ref_audio_url}")
-                        resp = requests.get(ref_audio_url, timeout=60)
-                        resp.raise_for_status()
-                        f.write(resp.content)
-                    ref_path = f.name
-                logger.info(f"Reference audio saved to: {ref_path}")
+        if audio_prompt_b64:
+            # Decode base64 audio and save to temp file
+            audio_bytes = base64.b64decode(audio_prompt_b64)
+            temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            temp_file.write(audio_bytes)
+            temp_file.close()
+            audio_prompt_path = temp_file.name
 
-            # Generate audio
-            logger.info("Generating audio...")
+        # Generate speech
+        wav = tts_model.generate(
+            text=text,
+            audio_prompt_path=audio_prompt_path,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight
+        )
 
-            if ref_path:
-                wav = model.generate(
-                    text,
-                    audio_prompt_path=ref_path,
-                    exaggeration=exaggeration,
-                    cfg_weight=cfg_weight
-                )
-            else:
-                wav = model.generate(
-                    text,
-                    exaggeration=exaggeration,
-                    cfg_weight=cfg_weight
-                )
+        # Clean up temp file
+        if temp_file:
+            os.unlink(temp_file.name)
 
-            logger.info(f"Generated wav shape: {wav.shape}")
+        # Convert to bytes
+        buffer = io.BytesIO()
+        torchaudio.save(buffer, wav, tts_model.sr, format="wav")
+        buffer.seek(0)
+        audio_b64 = base64.b64encode(buffer.read()).decode("utf-8")
 
-            # Save to buffer
-            buffer = io.BytesIO()
-            ta.save(buffer, wav, model.sr, format="wav")
-            audio_bytes = buffer.getvalue()
-
-            processing_time = time.time() - start_time
-            logger.info(f"Processing time: {processing_time:.2f}s")
-            logger.info(f"Audio size: {len(audio_bytes) / 1024:.2f}KB")
-            logger.info(f"Sample rate: {model.sr}")
-
-            # Encode as base64
-            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-            return {
-                "audio": audio_b64,
-                "status": "success",
-                "processing_time_seconds": round(processing_time, 2),
-                "chars_processed": len(text),
-                "sample_rate": model.sr,
-                "model": "chatterbox"
-            }
-
-        finally:
-            # Cleanup
-            if ref_path and os.path.exists(ref_path):
-                os.remove(ref_path)
+        return {
+            "audio": audio_b64,
+            "sample_rate": tts_model.sr
+        }
 
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
+        # Clean up temp file on error
+        if temp_file and os.path.exists(temp_file.name):
+            os.unlink(temp_file.name)
         return {"error": str(e)}
 
+# Pre-load model on cold start
+print("Loading Chatterbox TTS model...")
+load_model()
+print("Model loaded successfully!")
 
-# Pre-load model on startup
-logger.info("Pre-loading Chatterbox model...")
-try:
-    load_model()
-    logger.info("Model pre-loaded successfully")
-except Exception as e:
-    logger.error(f"Failed to pre-load model: {e}")
-
-# Start RunPod handler
 runpod.serverless.start({"handler": handler})
