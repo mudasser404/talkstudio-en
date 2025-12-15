@@ -44,6 +44,10 @@ def load_openvoice():
         tone_color_converter = ToneColorConverter(f'{ckpt_converter}/config.json', device=DEVICE)
         tone_color_converter.load_ckpt(f'{ckpt_converter}/checkpoint.pth')
 
+        # Fix: Manually set device attribute on model if missing
+        if hasattr(tone_color_converter, 'model') and not hasattr(tone_color_converter.model, 'device'):
+            tone_color_converter.model.device = DEVICE
+
         # Load MeloTTS for base audio generation
         melo_en = MeloTTS(language='EN', device=DEVICE)
 
