@@ -22,24 +22,14 @@ RUN pip install --upgrade pip setuptools wheel
 # Install torchaudio
 RUN pip install torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
 
-# Install all Python dependencies in one step
+# Install all Python dependencies
 RUN pip install --no-cache-dir \
-    runpod \
-    soundfile \
-    pydub \
-    requests \
-    huggingface_hub \
-    numpy \
-    librosa \
-    faster-whisper \
-    wavmark \
-    pypinyin \
-    cn2an \
-    jieba \
-    inflect \
-    unidecode \
-    eng_to_ipa \
-    langid
+    runpod soundfile pydub requests huggingface_hub numpy librosa scipy \
+    faster-whisper whisper-timestamped openai-whisper \
+    wavmark pypinyin cn2an jieba inflect unidecode eng_to_ipa langid \
+    transformers mecab-python3 num2words gruut g2p-en anyascii jamo gruut-ipa \
+    webrtcvad pyworld pyloudnorm praat-parselmouth torchcrepe \
+    cached-path tensorboard
 
 # Install MeloTTS from GitHub
 RUN pip install --no-cache-dir git+https://github.com/myshell-ai/MeloTTS.git && \
