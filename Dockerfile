@@ -4,7 +4,7 @@ FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV PIP_NO_CACHE_DIR=1
+ENV COQUI_TOS_AGREED=1
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -16,25 +16,14 @@ RUN apt-get update && apt-get install -y \
 # Upgrade pip
 RUN pip install --upgrade pip setuptools wheel
 
-# Set working directory
 WORKDIR /app
 
-# Install torchaudio
+# Install packages
 RUN pip install torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+RUN pip install runpod transformers==4.39.3 TTS
 
-# Install RunPod
-RUN pip install runpod
-
-# Install Coqui TTS with correct transformers version
-RUN pip install transformers==4.39.3
-RUN pip install TTS
-
-# Accept Coqui TTS TOS BEFORE downloading model
-RUN mkdir -p /root/.local/share/tts && \
-    echo "agreed" > /root/.local/share/tts/coqui_tos_agreed.txt
-
-# Pre-download XTTS-v2 model with TOS bypass
-RUN python -c "import os; os.makedirs('/root/.local/share/tts', exist_ok=True); open('/root/.local/share/tts/coqui_tos_agreed.txt', 'w').write('agreed'); from TTS.utils.manage import ModelManager; m = ModelManager(); setattr(m, 'ask_tos', lambda *a: True); from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2')"
+# Create TOS file
+RUN mkdir -p /root/.local/share/tts && echo "1" > /root/.local/share/tts/coqui_tos_agreed.txt
 
 # Copy handler
 COPY handler.py .
