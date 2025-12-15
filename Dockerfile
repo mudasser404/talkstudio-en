@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     git \
     ffmpeg \
     libsndfile1 \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip
@@ -20,20 +21,18 @@ WORKDIR /app
 # Install torchaudio
 RUN pip install torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
 
-# Install RunPod and audio processing
-RUN pip install runpod soundfile librosa pydub requests numpy huggingface_hub
+# Install RunPod and core dependencies first
+RUN pip install runpod soundfile pydub requests huggingface_hub
 
-# Clone and install OpenVoice V2
-RUN git clone https://github.com/myshell-ai/OpenVoice.git /tmp/OpenVoice && \
-    cd /tmp/OpenVoice && \
-    pip install -e . && \
-    rm -rf /tmp/OpenVoice/.git
+# Install OpenVoice dependencies manually (to avoid conflicts)
+RUN pip install librosa==0.9.1 numpy==1.22.0
+RUN pip install wavmark pypinyin cn2an jieba inflect unidecode eng_to_ipa langid
 
-# Clone and install MeloTTS (required for base TTS)
-RUN git clone https://github.com/myshell-ai/MeloTTS.git /tmp/MeloTTS && \
-    cd /tmp/MeloTTS && \
-    pip install -e . && \
-    rm -rf /tmp/MeloTTS/.git
+# Install OpenVoice from GitHub
+RUN pip install git+https://github.com/myshell-ai/OpenVoice.git --no-deps
+
+# Install MeloTTS
+RUN pip install git+https://github.com/myshell-ai/MeloTTS.git
 
 # Download unidic for MeloTTS
 RUN python -m unidic download
