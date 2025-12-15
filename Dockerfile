@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     libsndfile1 \
     build-essential \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip
@@ -21,21 +22,27 @@ WORKDIR /app
 # Install torchaudio
 RUN pip install torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
 
-# Install RunPod and core dependencies first
-RUN pip install runpod soundfile pydub requests huggingface_hub
+# Install core dependencies
+RUN pip install runpod soundfile pydub requests huggingface_hub numpy
 
-# Install OpenVoice dependencies manually (to avoid conflicts)
-RUN pip install librosa==0.9.1 numpy==1.22.0
+# Install audio processing
+RUN pip install librosa
+
+# Install MeloTTS first (it has fewer conflicts)
+RUN pip install melotts
+RUN python -m unidic download
+
+# Install OpenVoice dependencies
 RUN pip install wavmark pypinyin cn2an jieba inflect unidecode eng_to_ipa langid
 
-# Install OpenVoice from GitHub
-RUN pip install git+https://github.com/myshell-ai/OpenVoice.git --no-deps
+# Install faster-whisper for VAD in se_extractor
+RUN pip install faster-whisper
 
-# Install MeloTTS
-RUN pip install git+https://github.com/myshell-ai/MeloTTS.git
-
-# Download unidic for MeloTTS
-RUN python -m unidic download
+# Clone OpenVoice and install
+RUN git clone https://github.com/myshell-ai/OpenVoice.git /tmp/OpenVoice && \
+    cd /tmp/OpenVoice && \
+    pip install -e . --no-deps && \
+    cp -r /tmp/OpenVoice/openvoice /app/openvoice
 
 # Download OpenVoice V2 checkpoints
 RUN mkdir -p /app/checkpoints_v2
