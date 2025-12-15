@@ -35,13 +35,8 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir git+https://github.com/myshell-ai/MeloTTS.git && \
     python -m unidic download
 
-# Clone OpenVoice V2 (pinned to working commit)
-RUN git clone https://github.com/myshell-ai/OpenVoice.git /tmp/OpenVoice && \
-    cd /tmp/OpenVoice && \
-    git checkout v2 && \
-    pip install -e . --no-deps && \
-    cp -r /tmp/OpenVoice/openvoice /app/openvoice && \
-    rm -rf /tmp/OpenVoice
+# Clone OpenVoice (stable version for V2 checkpoints)
+RUN pip install --no-cache-dir git+https://github.com/myshell-ai/OpenVoice.git@main
 
 # Download OpenVoice V2 checkpoints
 RUN mkdir -p /app/checkpoints_v2 && \

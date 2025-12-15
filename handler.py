@@ -44,6 +44,13 @@ def load_openvoice():
         tone_color_converter = ToneColorConverter(f'{ckpt_converter}/config.json', device=DEVICE)
         tone_color_converter.load_ckpt(f'{ckpt_converter}/checkpoint.pth')
 
+        # Fix missing attributes in SynthesizerTrn model
+        if hasattr(tone_color_converter, 'model'):
+            if not hasattr(tone_color_converter.model, 'device'):
+                tone_color_converter.model.device = torch.device(DEVICE)
+            if not hasattr(tone_color_converter.model, 'version'):
+                tone_color_converter.model.version = "v2"
+
         # Load MeloTTS for base audio generation
         melo_en = MeloTTS(language='EN', device=DEVICE)
 
