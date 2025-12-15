@@ -1,6 +1,6 @@
 """
-RunPod Serverless Handler for XTTS-v2 Voice Cloning
-Optimized for speed with chunked processing
+RunPod Serverless Handler for OpenVoice V2 Voice Cloning
+High quality voice cloning with better similarity
 """
 
 import runpod
@@ -9,6 +9,7 @@ import os
 import re
 import time
 import tempfile
+import requests
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -19,73 +20,43 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==============================
-# Accept Coqui TTS Terms of Service (bypass interactive prompt)
-# Must patch BEFORE importing TTS
+# Global Settings
 # ==============================
-import TTS.utils.manage as tts_manage
-
-def _patched_ask_tos(self, output_path):
-    """Patched to auto-accept TOS without interactive prompt."""
-    return True
-
-tts_manage.ModelManager.ask_tos = _patched_ask_tos
-logger.info("Patched Coqui TTS to auto-accept TOS")
-
-# ==============================
-# Global model
-# ==============================
-from TTS.api import TTS
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-_tts_model: Optional[TTS] = None
+MODELS = {}
 
-# Speaker embedding cache
-_speaker_embedding = None
-_gpt_cond_latent = None
-_cached_ref_path = None
-
-
-def get_tts_model():
-    """Load XTTS-v2 model once and reuse"""
-    global _tts_model
-    if _tts_model is None:
-        logger.info("========== LOADING XTTS-v2 MODEL ==========")
+# ==============================
+# Model Loading
+# ==============================
+def load_openvoice():
+    """Load OpenVoice V2 model"""
+    if "openvoice" not in MODELS:
+        logger.info("========== LOADING OpenVoice V2 ==========")
         logger.info(f"CUDA available: {torch.cuda.is_available()}")
         logger.info(f"Device: {DEVICE}")
 
-        _tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(DEVICE)
+        from openvoice import se_extractor
+        from openvoice.api import ToneColorConverter
+        from melo.api import TTS as MeloTTS
 
-        logger.info("XTTS-v2 loaded successfully")
+        # Load ToneColorConverter
+        ckpt_converter = '/app/checkpoints_v2/converter'
+        tone_color_converter = ToneColorConverter(f'{ckpt_converter}/config.json', device=DEVICE)
+        tone_color_converter.load_ckpt(f'{ckpt_converter}/checkpoint.pth')
+
+        # Load MeloTTS for base audio generation
+        melo_en = MeloTTS(language='EN', device=DEVICE)
+
+        MODELS["openvoice"] = {
+            "converter": tone_color_converter,
+            "se_extractor": se_extractor,
+            "melo_en": melo_en
+        }
+
+        logger.info("OpenVoice V2 loaded successfully")
         logger.info("============================================")
 
-    return _tts_model
-
-
-def _get_speaker_embedding(tts, ref_path: str, gpt_cond_len: int = 6):
-    """
-    Compute speaker embedding once and cache it.
-    Saves ~2-3 seconds per chunk.
-    """
-    global _speaker_embedding, _gpt_cond_latent, _cached_ref_path
-
-    if _speaker_embedding is None or _gpt_cond_latent is None or _cached_ref_path != ref_path:
-        logger.info(f"Computing speaker embedding (gpt_cond_len={gpt_cond_len}s)...")
-        try:
-            xtts_model = tts.synthesizer.tts_model
-            gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
-                audio_path=[ref_path],
-                gpt_cond_len=gpt_cond_len,
-                max_ref_length=10,
-            )
-            _speaker_embedding = speaker_embedding
-            _gpt_cond_latent = gpt_cond_latent
-            _cached_ref_path = ref_path
-            logger.info("Speaker embedding cached successfully")
-        except Exception as e:
-            logger.error(f"Could not cache embedding: {e}")
-            return None, None
-
-    return _gpt_cond_latent, _speaker_embedding
+    return MODELS["openvoice"]
 
 
 # ==============================
@@ -96,11 +67,8 @@ def _split_into_sentences(text: str) -> List[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
-def _chunk_text(text: str, max_chars: int = 245, min_chars: int = 100) -> List[str]:
-    """
-    Split text into chunks for TTS processing.
-    IMPORTANT: XTTS v2 has a 250 character limit per chunk!
-    """
+def _chunk_text(text: str, max_chars: int = 400, min_chars: int = 150) -> List[str]:
+    """Split text into chunks for TTS processing"""
     sentences = _split_into_sentences(text)
     chunks, current = [], ""
 
@@ -134,145 +102,159 @@ def _clean_for_tts(text: str) -> str:
 
 
 # ==============================
-# TTS Processing
+# Audio Processing
 # ==============================
-def _tts_chunk_fast(
-    xtts_model,
-    text: str,
-    language: str,
-    gpt_cond_latent,
-    speaker_embedding,
-    speed: float = 1.0,
-) -> np.ndarray:
-    """Fast TTS with cached embeddings and optimized parameters"""
-    out = xtts_model.inference(
-        text=text,
-        language=language,
-        gpt_cond_latent=gpt_cond_latent,
-        speaker_embedding=speaker_embedding,
-        speed=speed,
-        enable_text_splitting=False,
-        temperature=0.65,
-        top_k=30,
-        top_p=0.8,
-        repetition_penalty=5.0,
-        length_penalty=1.0,
-        do_sample=True,
-    )
-    return out["wav"]
+def remove_silence_from_audio(audio_path: str, output_path: str):
+    """Remove silence from audio using pydub"""
+    try:
+        from pydub import AudioSegment
+        from pydub.silence import detect_nonsilent
+
+        audio = AudioSegment.from_file(audio_path)
+        nonsilent_ranges = detect_nonsilent(audio, min_silence_len=500, silence_thresh=-40)
+
+        if nonsilent_ranges:
+            output_audio = AudioSegment.empty()
+            for start, end in nonsilent_ranges:
+                output_audio += audio[start:end]
+            output_audio.export(output_path, format="wav")
+        else:
+            # No silence detected, copy original
+            import shutil
+            shutil.copy(audio_path, output_path)
+    except Exception as e:
+        logger.warning(f"Could not remove silence: {e}")
+        import shutil
+        shutil.copy(audio_path, output_path)
 
 
-def process_text(
-    tts,
-    ref_path: str,
+def combine_audio_files(audio_files: List[str], output_path: str, pause_seconds: float = 0.15, sr: int = 24000):
+    """Combine multiple audio files into one"""
+    import soundfile as sf
+
+    all_audio = []
+    pause_samples = int(sr * pause_seconds)
+    silence = np.zeros(pause_samples, dtype=np.float32)
+
+    for i, audio_file in enumerate(audio_files):
+        audio, file_sr = sf.read(audio_file)
+
+        # Resample if needed
+        if file_sr != sr:
+            import librosa
+            audio = librosa.resample(audio, orig_sr=file_sr, target_sr=sr)
+
+        all_audio.append(audio)
+
+        # Add pause between chunks
+        if i < len(audio_files) - 1:
+            all_audio.append(silence)
+
+    # Concatenate all
+    final_audio = np.concatenate(all_audio)
+    sf.write(output_path, final_audio, sr)
+
+    return output_path
+
+
+# ==============================
+# Voice Cloning
+# ==============================
+def clone_voice_openvoice(
     text: str,
+    ref_audio_path: str,
     language: str = "en",
     speed: float = 1.0,
-    gpt_cond_len: int = 6,
-) -> Tuple[List[np.ndarray], int]:
-    """Process text in chunks and return audio segments"""
-
-    # Get cached embeddings
-    gpt_cond_latent, speaker_embedding = _get_speaker_embedding(tts, ref_path, gpt_cond_len)
-
-    if gpt_cond_latent is None:
-        raise Exception("Failed to compute speaker embedding")
-
-    xtts_model = tts.synthesizer.tts_model
-    sr = tts.synthesizer.output_sample_rate
-
-    # Chunk text
-    chunks = _chunk_text(text, max_chars=245, min_chars=100)
-    logger.info(f"Processing {len(chunks)} chunks ({len(text)} total chars)")
-
-    all_segments = []
+    chunk_max_chars: int = 400,
+    chunk_min_chars: int = 150,
+    pause_s: float = 0.15,
+    remove_silence: bool = True,
+    volume: float = 1.0,
+) -> Tuple[bytes, float]:
+    """
+    Clone voice using OpenVoice V2
+    Returns: (audio_bytes, processing_time)
+    """
     start_time = time.time()
 
-    for idx, chunk in enumerate(chunks):
-        cleaned = _clean_for_tts(chunk)
-        chunk_start = time.time()
+    model = load_openvoice()
+    converter = model["converter"]
+    se_extractor = model["se_extractor"]
+    melo = model["melo_en"]
 
-        try:
-            audio_np = _tts_chunk_fast(
-                xtts_model, cleaned, language,
-                gpt_cond_latent, speaker_embedding, speed
+    # Get speaker IDs from MeloTTS
+    speaker_ids = melo.hps.data.spk2id
+    speaker_key = list(speaker_ids.keys())[0]  # Use first available speaker
+    speaker_id = speaker_ids[speaker_key]
+
+    logger.info(f"Using MeloTTS speaker: {speaker_key}")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Extract target speaker embedding from reference audio
+        logger.info("Extracting target speaker embedding...")
+        target_se, _ = se_extractor.get_se(ref_audio_path, converter.model, vad=True)
+
+        # Chunk text
+        chunks = _chunk_text(text, max_chars=chunk_max_chars, min_chars=chunk_min_chars)
+        logger.info(f"Processing {len(chunks)} chunks ({len(text)} total chars)")
+
+        output_files = []
+
+        for idx, chunk in enumerate(chunks):
+            cleaned = _clean_for_tts(chunk)
+            chunk_start = time.time()
+
+            # Paths for this chunk
+            base_audio_path = os.path.join(tmp_dir, f"base_{idx}.wav")
+            converted_path = os.path.join(tmp_dir, f"converted_{idx}.wav")
+
+            # Step 1: Generate base audio with MeloTTS
+            melo.tts_to_file(cleaned, speaker_id, base_audio_path, speed=speed)
+
+            # Step 2: Extract source speaker embedding
+            source_se, _ = se_extractor.get_se(base_audio_path, converter.model, vad=True)
+
+            # Step 3: Convert tone color to target voice
+            converter.convert(
+                audio_src_path=base_audio_path,
+                src_se=source_se,
+                tgt_se=target_se,
+                output_path=converted_path,
             )
 
-            # Convert to int16
-            if isinstance(audio_np, torch.Tensor):
-                audio_np = audio_np.cpu().numpy()
+            # Step 4: Remove silence if requested
+            if remove_silence:
+                final_chunk_path = os.path.join(tmp_dir, f"final_{idx}.wav")
+                remove_silence_from_audio(converted_path, final_chunk_path)
+            else:
+                final_chunk_path = converted_path
 
-            if audio_np.dtype in [np.float32, np.float64]:
-                audio_np = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
-
-            all_segments.append(audio_np)
+            output_files.append(final_chunk_path)
 
             chunk_time = time.time() - chunk_start
             logger.info(f"Chunk {idx+1}/{len(chunks)}: {len(cleaned)} chars in {chunk_time:.2f}s")
 
-        except Exception as e:
-            logger.error(f"Error on chunk {idx+1}: {e}")
-            raise
+        # Combine all chunks
+        logger.info("Combining audio chunks...")
+        final_output = os.path.join(tmp_dir, "final_output.wav")
+        combine_audio_files(output_files, final_output, pause_seconds=pause_s)
 
-    total_time = time.time() - start_time
-    logger.info(f"All {len(chunks)} chunks done in {total_time:.2f}s")
+        # Apply volume if needed
+        if volume != 1.0:
+            import soundfile as sf
+            audio, sr = sf.read(final_output)
+            audio = audio * volume
+            audio = np.clip(audio, -1.0, 1.0)
+            sf.write(final_output, audio, sr)
 
-    return all_segments, sr
+        # Read final audio as bytes
+        with open(final_output, 'rb') as f:
+            audio_bytes = f.read()
 
+    processing_time = time.time() - start_time
+    logger.info(f"Total processing time: {processing_time:.2f}s")
 
-def combine_audio(segments: List[np.ndarray], sr: int, pause_seconds: float = 0.1) -> bytes:
-    """Combine audio segments into single WAV file"""
-    import struct
-    import io
-
-    # Add pauses between segments
-    if pause_seconds > 0 and len(segments) > 1:
-        pause_samples = int(sr * pause_seconds)
-        silence = np.zeros(pause_samples, dtype=np.int16)
-
-        with_pauses = []
-        for i, seg in enumerate(segments):
-            with_pauses.append(seg)
-            if i < len(segments) - 1:
-                with_pauses.append(silence)
-        segments = with_pauses
-
-    # Calculate total samples
-    total_samples = sum(len(seg) for seg in segments)
-
-    # Create WAV in memory
-    buffer = io.BytesIO()
-
-    # WAV header
-    buffer.write(b'RIFF')
-    buffer.write(struct.pack('<I', 0))  # Placeholder
-    buffer.write(b'WAVE')
-
-    # Format chunk
-    buffer.write(b'fmt ')
-    buffer.write(struct.pack('<I', 16))
-    buffer.write(struct.pack('<H', 1))   # PCM
-    buffer.write(struct.pack('<H', 1))   # Mono
-    buffer.write(struct.pack('<I', sr))
-    buffer.write(struct.pack('<I', sr * 2))
-    buffer.write(struct.pack('<H', 2))
-    buffer.write(struct.pack('<H', 16))
-
-    # Data chunk
-    buffer.write(b'data')
-    data_size = total_samples * 2
-    buffer.write(struct.pack('<I', data_size))
-
-    # Write audio data
-    for segment in segments:
-        buffer.write(segment.tobytes())
-
-    # Update file size
-    file_size = buffer.tell()
-    buffer.seek(4)
-    buffer.write(struct.pack('<I', file_size - 8))
-
-    return buffer.getvalue()
+    return audio_bytes, processing_time
 
 
 # ==============================
@@ -280,60 +262,85 @@ def combine_audio(segments: List[np.ndarray], sr: int, pause_seconds: float = 0.
 # ==============================
 def handler(job):
     """
-    RunPod handler for XTTS-v2 voice cloning
+    RunPod handler for OpenVoice V2 voice cloning
 
-    Input:
+    Input format:
     {
         "input": {
             "text": "Text to synthesize",
-            "reference_audio": "base64 encoded audio",
+            "ref_audio_url": "URL to reference audio",
+            "ref_audio_base64": "OR base64 encoded audio",
             "language": "en",
-            "speed": 1.0,
-            "gpt_cond_len": 6
+            "remove_silence": "true",
+            "chunk_max_chars": 400,
+            "chunk_min_chars": 150,
+            "pause_s": 0.15,
+            "speed": 0.95,
+            "quality": "standard",
+            "volume": 1
         }
     }
     """
-    logger.info("### handler version: xtts_v2_optimized_v1_2025-12-15 ###")
+    logger.info("### handler version: openvoice_v2_2025-12-15 ###")
 
     try:
         job_input = job.get("input", {})
 
+        # Required
         text = job_input.get("text", "").strip()
-        reference_audio_b64 = job_input.get("reference_audio")
-        language = job_input.get("language", "en")
-        speed = float(job_input.get("speed", 1.0))
-        gpt_cond_len = int(job_input.get("gpt_cond_len", 6))
+        ref_audio_url = job_input.get("ref_audio_url")
+        ref_audio_base64 = job_input.get("ref_audio_base64")
 
+        # Optional with defaults
+        language = job_input.get("language", "en")
+        remove_silence = str(job_input.get("remove_silence", "true")).lower() == "true"
+        chunk_max_chars = int(job_input.get("chunk_max_chars", 400))
+        chunk_min_chars = int(job_input.get("chunk_min_chars", 150))
+        pause_s = float(job_input.get("pause_s", 0.15))
+        speed = float(job_input.get("speed", 1.0))
+        volume = float(job_input.get("volume", 1.0))
+
+        # Validation
         if not text:
             return {"error": "Text is required"}
 
-        if not reference_audio_b64:
-            return {"error": "reference_audio is required"}
+        if not ref_audio_url and not ref_audio_base64:
+            return {"error": "ref_audio_url or ref_audio_base64 is required"}
 
         logger.info(f"Text length: {len(text)} chars")
-        logger.info(f"Language: {language}, Speed: {speed}")
+        logger.info(f"Language: {language}, Speed: {speed}, Volume: {volume}")
+        logger.info(f"Chunk settings: max={chunk_max_chars}, min={chunk_min_chars}")
+        logger.info(f"Remove silence: {remove_silence}, Pause: {pause_s}s")
 
-        # Save reference audio
+        # Download/decode reference audio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(base64.b64decode(reference_audio_b64))
+            if ref_audio_base64:
+                logger.info("Using base64 reference audio")
+                f.write(base64.b64decode(ref_audio_base64))
+            else:
+                logger.info(f"Downloading reference audio: {ref_audio_url}")
+                resp = requests.get(ref_audio_url, timeout=60)
+                resp.raise_for_status()
+                f.write(resp.content)
             ref_path = f.name
 
         try:
-            # Get model
-            tts = get_tts_model()
-
-            # Process text
-            start_time = time.time()
-            segments, sr = process_text(tts, ref_path, text, language, speed, gpt_cond_len)
-
-            # Combine audio
-            audio_bytes = combine_audio(segments, sr)
-            processing_time = time.time() - start_time
+            # Clone voice
+            audio_bytes, processing_time = clone_voice_openvoice(
+                text=text,
+                ref_audio_path=ref_path,
+                language=language,
+                speed=speed,
+                chunk_max_chars=chunk_max_chars,
+                chunk_min_chars=chunk_min_chars,
+                pause_s=pause_s,
+                remove_silence=remove_silence,
+                volume=volume,
+            )
 
             # Encode as base64
             audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
-            logger.info(f"Total processing time: {processing_time:.2f}s")
             logger.info(f"Audio size: {len(audio_bytes) / 1024 / 1024:.2f}MB")
 
             return {
@@ -341,7 +348,7 @@ def handler(job):
                 "status": "success",
                 "processing_time_seconds": round(processing_time, 2),
                 "chars_processed": len(text),
-                "sample_rate": sr
+                "model": "openvoice_v2"
             }
 
         finally:
@@ -351,13 +358,15 @@ def handler(job):
 
     except Exception as e:
         logger.error(f"Error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
         return {"error": str(e)}
 
 
 # Pre-load model on startup
-logger.info("Pre-loading XTTS-v2 model...")
+logger.info("Pre-loading OpenVoice V2 model...")
 try:
-    get_tts_model()
+    load_openvoice()
     logger.info("Model pre-loaded successfully")
 except Exception as e:
     logger.error(f"Failed to pre-load model: {e}")

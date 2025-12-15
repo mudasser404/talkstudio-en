@@ -1,10 +1,9 @@
-# RunPod Serverless Dockerfile for XTTS-v2 Voice Cloning
+# RunPod Serverless Dockerfile for OpenVoice V2 Voice Cloning
 
 FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV COQUI_TOS_AGREED=1
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -18,12 +17,24 @@ RUN pip install --upgrade pip setuptools wheel
 
 WORKDIR /app
 
-# Install packages
+# Install torchaudio
 RUN pip install torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
-RUN pip install runpod transformers==4.39.3 TTS
 
-# Create TOS file
-RUN mkdir -p /root/.local/share/tts && echo "1" > /root/.local/share/tts/coqui_tos_agreed.txt
+# Install RunPod and audio processing
+RUN pip install runpod soundfile librosa pydub requests
+
+# Install OpenVoice V2
+RUN pip install git+https://github.com/myshell-ai/OpenVoice.git
+
+# Install MeloTTS (required for base TTS)
+RUN pip install git+https://github.com/myshell-ai/MeloTTS.git
+
+# Download OpenVoice V2 checkpoints
+RUN mkdir -p /app/checkpoints_v2
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='myshell-ai/OpenVoiceV2', local_dir='/app/checkpoints_v2')"
+
+# Pre-download MeloTTS model
+RUN python -c "from melo.api import TTS; TTS(language='EN')"
 
 # Copy handler
 COPY handler.py .
