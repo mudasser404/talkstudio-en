@@ -21,13 +21,16 @@ WORKDIR /app
 RUN pip install torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
 
 # Install RunPod and audio processing
-RUN pip install runpod soundfile librosa pydub requests
+RUN pip install runpod soundfile librosa pydub requests numpy huggingface_hub
 
 # Install OpenVoice V2
 RUN pip install git+https://github.com/myshell-ai/OpenVoice.git
 
 # Install MeloTTS (required for base TTS)
 RUN pip install git+https://github.com/myshell-ai/MeloTTS.git
+
+# Download unidic for MeloTTS
+RUN python -m unidic download
 
 # Download OpenVoice V2 checkpoints
 RUN mkdir -p /app/checkpoints_v2
