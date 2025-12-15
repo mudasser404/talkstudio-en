@@ -23,11 +23,17 @@ RUN pip install torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/c
 # Install RunPod and audio processing
 RUN pip install runpod soundfile librosa pydub requests numpy huggingface_hub
 
-# Install OpenVoice V2
-RUN pip install git+https://github.com/myshell-ai/OpenVoice.git
+# Clone and install OpenVoice V2
+RUN git clone https://github.com/myshell-ai/OpenVoice.git /tmp/OpenVoice && \
+    cd /tmp/OpenVoice && \
+    pip install -e . && \
+    rm -rf /tmp/OpenVoice/.git
 
-# Install MeloTTS (required for base TTS)
-RUN pip install git+https://github.com/myshell-ai/MeloTTS.git
+# Clone and install MeloTTS (required for base TTS)
+RUN git clone https://github.com/myshell-ai/MeloTTS.git /tmp/MeloTTS && \
+    cd /tmp/MeloTTS && \
+    pip install -e . && \
+    rm -rf /tmp/MeloTTS/.git
 
 # Download unidic for MeloTTS
 RUN python -m unidic download
