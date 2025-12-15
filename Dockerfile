@@ -23,9 +23,6 @@ RUN pip install --no-cache-dir chatterbox-tts
 # Install RunPod and other dependencies
 RUN pip install --no-cache-dir runpod requests torchaudio
 
-# Pre-download model
-RUN python -c "from chatterbox.tts_turbo import ChatterboxTurboTTS; ChatterboxTurboTTS.from_pretrained(device='cpu')"
-
 # Copy handler
 COPY handler.py .
 
