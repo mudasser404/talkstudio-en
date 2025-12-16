@@ -23,7 +23,8 @@ RUN git clone https://github.com/resemble-ai/chatterbox.git /app/chatterbox && \
 
 COPY handler.py .
 
-# Pre-download TURBO weights during build (CPU)
-RUN python -c "from chatterbox.tts_turbo import ChatterboxTurboTTS; ChatterboxTurboTTS.from_pretrained(device='cpu')"
+# Pre-download TURBO weights during build (commented out to avoid build failures)
+# Model will be downloaded on first cold start instead
+# RUN python -c "from chatterbox.tts_turbo import ChatterboxTurboTTS; ChatterboxTurboTTS.from_pretrained(device='cpu')"
 
 CMD ["python", "-u", "handler.py"]
