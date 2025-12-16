@@ -8,28 +8,42 @@ import tempfile
 import urllib.request
 import re
 
-# Enable CUDA debugging (NOTE: this can slow things down; consider disabling once stable)
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+from huggingface_hub import login
 
-# Hugging Face token from environment variable
-HF_TOKEN = os.environ.get("HF_TOKEN", None)
+# Optional: set to "1" only for debugging; it slows down GPU
+if os.getenv("CUDA_LAUNCH_BLOCKING", "0") == "1":
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+else:
+    os.environ.pop("CUDA_LAUNCH_BLOCKING", None)
 
+# Global model variable
 model = None
+hf_logged_in = False
+
+
+def ensure_hf_login():
+    """Login to Hugging Face once if token is provided."""
+    global hf_logged_in
+    if hf_logged_in:
+        return
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    if token:
+        login(token=token, add_to_git_credential=False)
+        print("Hugging Face login: OK (token provided)")
+    else:
+        print("WARNING: No HF token found in env (HF_TOKEN / HUGGINGFACE_HUB_TOKEN). "
+              "Turbo weights may fail to download if the repo requires authentication.")
+    hf_logged_in = True
+
 
 def load_model():
     """Load the Chatterbox TURBO TTS model."""
     global model
     if model is None:
-        # ✅ TURBO import
-        from chatterbox.tts_turbo import ChatterboxTurboTTS
-        from huggingface_hub import login
+        ensure_hf_login()
 
-        # Login to Hugging Face if token is available
-        if HF_TOKEN:
-            print("Logging in to Hugging Face...")
-            login(token=HF_TOKEN)
-        else:
-            print("WARNING: No HF_TOKEN found. Set HF_TOKEN environment variable in RunPod.")
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"CUDA available: {torch.cuda.is_available()}")
@@ -37,31 +51,39 @@ def load_model():
             print(f"CUDA device: {torch.cuda.get_device_name(0)}")
             print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
-        # ✅ TURBO load
         model = ChatterboxTurboTTS.from_pretrained(device=device)
-
-        # Helpful sanity check
         print(f"Loaded class: {type(model).__name__}")
         print(f"Chatterbox TURBO model loaded on {device}")
 
     return model
 
+
 def download_audio(url, output_path):
+    """Download audio from URL."""
     print(f"Downloading audio from: {url}")
     urllib.request.urlretrieve(url, output_path)
     print(f"Downloaded to: {output_path}")
 
+
 def convert_to_wav(input_path, output_path):
+    """Convert audio to WAV format using torchaudio."""
     waveform, sample_rate = torchaudio.load(input_path)
+
+    # Convert to mono if stereo
     if waveform.shape[0] > 1:
         waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+    # Resample to 24kHz (Chatterbox requirement)
     if sample_rate != 24000:
         resampler = torchaudio.transforms.Resample(sample_rate, 24000)
         waveform = resampler(waveform)
+
     torchaudio.save(output_path, waveform, 24000)
     print(f"Converted to WAV: {output_path}")
 
+
 def chunk_text(text, max_chars=400, min_chars=150):
+    """Split text into chunks for processing."""
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
     current_chunk = ""
@@ -82,16 +104,24 @@ def chunk_text(text, max_chars=400, min_chars=150):
 
     return chunks
 
+
 def adjust_audio_speed(waveform, sample_rate, speed):
+    """Adjust audio speed."""
     if speed != 1.0:
         effects = [["tempo", str(speed)]]
-        waveform, sample_rate = torchaudio.sox_effects.apply_effects_tensor(waveform, sample_rate, effects)
+        waveform, sample_rate = torchaudio.sox_effects.apply_effects_tensor(
+            waveform, sample_rate, effects
+        )
     return waveform, sample_rate
 
+
 def adjust_audio_volume(waveform, volume):
+    """Adjust audio volume."""
     return waveform * volume
 
-def remove_silence_from_audio(waveform, sample_rate, threshold=0.01):
+
+def remove_silence_from_audio(waveform, threshold=0.01):
+    """Remove silence from beginning and end of audio."""
     abs_waveform = torch.abs(waveform)
     non_silent = abs_waveform > threshold
     non_silent_indices = torch.where(non_silent.any(dim=0))[0]
@@ -102,7 +132,25 @@ def remove_silence_from_audio(waveform, sample_rate, threshold=0.01):
         return waveform[:, start:end]
     return waveform
 
+
 def handler(job):
+    """
+    RunPod serverless handler for Chatterbox TURBO TTS.
+
+    Input:
+        - text: Text to synthesize (required)
+        - ref_audio_url: URL to reference audio for voice cloning (required)
+        - remove_silence: Remove silence from output (default: "true")
+        - chunk_max_chars: Max characters per chunk (default: 400)
+        - chunk_min_chars: Min characters per chunk (default: 150)
+        - pause_s: Pause between chunks in seconds (default: 0.15)
+        - speed: Playback speed multiplier (default: 1)
+        - volume: Volume multiplier (default: 1)
+
+    Output:
+        - audio: Base64 encoded WAV audio
+        - sample_rate: Sample rate of the output audio
+    """
     job_input = job["input"]
 
     text = job_input.get("text")
@@ -113,7 +161,6 @@ def handler(job):
     if not ref_audio_url:
         return {"error": "ref_audio_url is required"}
 
-    language = job_input.get("language", "en")
     remove_silence = str(job_input.get("remove_silence", "true")).lower() == "true"
     chunk_max_chars = int(job_input.get("chunk_max_chars", 400))
     chunk_min_chars = int(job_input.get("chunk_min_chars", 150))
@@ -128,8 +175,9 @@ def handler(job):
             torch.cuda.empty_cache()
 
         tts_model = load_model()
-        sample_rate = tts_model.sr
+        sample_rate = tts_model.sr  # 24000
 
+        # Download + convert reference audio
         ref_audio_ext = os.path.splitext(ref_audio_url)[1] or ".mp3"
         ref_audio_temp = tempfile.NamedTemporaryFile(suffix=ref_audio_ext, delete=False)
         ref_audio_temp.close()
@@ -141,9 +189,11 @@ def handler(job):
         temp_files.append(ref_wav_temp.name)
         convert_to_wav(ref_audio_temp.name, ref_wav_temp.name)
 
+        # Chunk text
         chunks = chunk_text(text, chunk_max_chars, chunk_min_chars)
         print(f"Split text into {len(chunks)} chunks")
 
+        # Generate per chunk
         audio_segments = []
         pause_samples = int(pause_s * sample_rate)
         pause_tensor = torch.zeros(1, pause_samples)
@@ -159,11 +209,12 @@ def handler(job):
                     cfg_weight=0.5
                 )
 
+            # Move to CPU for post-processing / concat
             if wav.is_cuda:
                 wav = wav.cpu()
 
             if remove_silence:
-                wav = remove_silence_from_audio(wav, sample_rate)
+                wav = remove_silence_from_audio(wav)
 
             audio_segments.append(wav)
 
@@ -185,16 +236,15 @@ def handler(job):
 
         print(f"Generated audio: {final_audio.shape[1] / sample_rate:.2f} seconds")
 
-        for f in temp_files:
-            if os.path.exists(f):
-                os.unlink(f)
-
         return {"audio": audio_b64, "sample_rate": sample_rate}
 
     except Exception as e:
         import traceback
-        print(f"Error: {str(e)}\n{traceback.format_exc()}")
+        tb = traceback.format_exc()
+        print(f"Error: {str(e)}\n{tb}")
+        return {"error": str(e), "traceback": tb}
 
+    finally:
         for f in temp_files:
             if os.path.exists(f):
                 os.unlink(f)
@@ -202,8 +252,8 @@ def handler(job):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return {"error": str(e), "traceback": traceback.format_exc()}
 
+# Pre-load model on cold start
 print("Loading Chatterbox TURBO TTS model...")
 try:
     load_model()
