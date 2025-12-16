@@ -11,6 +11,9 @@ import re
 # Enable CUDA debugging (NOTE: this can slow things down; consider disabling once stable)
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
+# Hugging Face token from environment variable
+HF_TOKEN = os.environ.get("HF_TOKEN", None)
+
 model = None
 
 def load_model():
@@ -19,6 +22,14 @@ def load_model():
     if model is None:
         # ✅ TURBO import
         from chatterbox.tts_turbo import ChatterboxTurboTTS
+        from huggingface_hub import login
+
+        # Login to Hugging Face if token is available
+        if HF_TOKEN:
+            print("Logging in to Hugging Face...")
+            login(token=HF_TOKEN)
+        else:
+            print("WARNING: No HF_TOKEN found. Set HF_TOKEN environment variable in RunPod.")
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"CUDA available: {torch.cuda.is_available()}")
