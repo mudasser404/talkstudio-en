@@ -11,10 +11,6 @@ import time
 
 from huggingface_hub import login
 
-# =========================
-# ENV / GLOBALS
-# =========================
-
 # Optional: enable only for debugging (VERY slow if enabled)
 if os.getenv("CUDA_LAUNCH_BLOCKING", "0") == "1":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -28,10 +24,6 @@ torch.set_float32_matmul_precision("high")
 model = None
 hf_logged_in = False
 
-
-# =========================
-# HUGGING FACE LOGIN
-# =========================
 
 def ensure_hf_login():
     global hf_logged_in
@@ -47,10 +39,6 @@ def ensure_hf_login():
 
     hf_logged_in = True
 
-
-# =========================
-# MODEL LOADING
-# =========================
 
 def load_model():
     global model
@@ -71,10 +59,6 @@ def load_model():
     return model
 
 
-# =========================
-# AUDIO HELPERS
-# =========================
-
 def download_audio(url, output_path):
     print(f"Downloading audio from: {url}")
     urllib.request.urlretrieve(url, output_path)
@@ -84,9 +68,11 @@ def download_audio(url, output_path):
 def convert_to_wav(input_path, output_path):
     waveform, sample_rate = torchaudio.load(input_path)
 
+    # mono
     if waveform.shape[0] > 1:
         waveform = torch.mean(waveform, dim=0, keepdim=True)
 
+    # 24k
     if sample_rate != 24000:
         resampler = torchaudio.transforms.Resample(sample_rate, 24000)
         waveform = resampler(waveform)
@@ -95,77 +81,66 @@ def convert_to_wav(input_path, output_path):
     print(f"Converted to WAV: {output_path}")
 
 
-# =========================
-# FIXED CHUNKER (IMPORTANT)
-# =========================
-
 def chunk_text(text, max_chars=2000, min_chars=800):
     """
-    Robust chunker:
-    - Produces near-max chunks
-    - Prefers sentence boundaries
-    - Falls back to strict slicing if fragmentation is detected
+    Strong chunker:
+    - Targets near max_chars chunks (prevents fragmentation)
+    - Only cuts at punctuation in the last 30% of the window
+    - Otherwise cuts at whitespace near the end
+    - Merges too-small tail chunks
     """
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", (text or "")).strip()
     n = len(text)
     if n == 0:
         return []
 
-    def primary():
-        chunks = []
-        start = 0
-        while start < n:
-            end = min(start + max_chars, n)
+    max_chars = int(max_chars)
+    min_chars = int(min_chars)
+    if max_chars < 200:
+        max_chars = 200
+    if min_chars < 1:
+        min_chars = 1
+    if min_chars >= max_chars:
+        min_chars = max(1, max_chars - 200)
 
-            if end < n:
-                window = text[start:end]
-                matches = list(re.finditer(r"[.!?]", window))
-                if matches:
-                    last_end = matches[-1].end()
-                    if last_end >= min_chars:
-                        end = start + last_end
+    chunks = []
+    start = 0
 
-            chunk = text[start:end].strip()
-            if len(chunk) < min_chars and chunks:
-                chunks[-1] = (chunks[-1] + " " + chunk).strip()
+    while start < n:
+        end = min(start + max_chars, n)
+
+        if end < n:
+            window = text[start:end]
+
+            # Prefer punctuation only near the end of the window (last 30%)
+            tail_start = int(len(window) * 0.7)
+            tail = window[tail_start:]
+            punct = list(re.finditer(r"[.!?]", tail))
+            if punct:
+                cut = tail_start + punct[-1].end()
+                if cut >= min_chars:
+                    end = start + cut
             else:
-                chunks.append(chunk)
+                # Otherwise break at whitespace near end (but not before min_chars)
+                ws = window.rfind(" ")
+                if ws >= min_chars:
+                    end = start + ws
 
-            start = end
-        return chunks
+        chunk = text[start:end].strip()
 
-    def fallback():
-        chunks = []
-        start = 0
-        while start < n:
+        # Merge tiny remainder into previous chunk
+        if len(chunk) < min_chars and chunks:
+            chunks[-1] = (chunks[-1] + " " + chunk).strip()
+        else:
+            chunks.append(chunk)
+
+        # Safety to avoid infinite loop
+        if end <= start:
             end = min(start + max_chars, n)
-            if end < n:
-                cut = text.rfind(" ", start + min_chars, end)
-                if cut != -1:
-                    end = cut
-
-            chunk = text[start:end].strip()
-            if len(chunk) < min_chars and chunks:
-                chunks[-1] = (chunks[-1] + " " + chunk).strip()
-            else:
-                chunks.append(chunk)
-
-            start = end
-        return chunks
-
-    chunks = primary()
-    expected_max = max(1, (n // max_chars) + 6)
-
-    if len(chunks) > expected_max:
-        print(f"[chunk_text] Fragmentation detected ({len(chunks)} chunks). Using fallback.")
-        chunks = fallback()
+        start = end
 
     return chunks
 
-
-# =========================
-# POST PROCESS
-# =========================
 
 def remove_silence_from_audio(waveform, threshold=0.01):
     abs_waveform = torch.abs(waveform)
@@ -175,10 +150,6 @@ def remove_silence_from_audio(waveform, threshold=0.01):
         return waveform[:, idx[0]:idx[-1] + 1]
     return waveform
 
-
-# =========================
-# HANDLER
-# =========================
 
 def handler(job):
     job_input = job["input"]
@@ -200,7 +171,8 @@ def handler(job):
         sample_rate = tts_model.sr
 
         # Reference audio
-        ref_audio_tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        ref_audio_ext = os.path.splitext(ref_audio_url)[1] or ".mp3"
+        ref_audio_tmp = tempfile.NamedTemporaryFile(suffix=ref_audio_ext, delete=False)
         ref_audio_tmp.close()
         temp_files.append(ref_audio_tmp.name)
         download_audio(ref_audio_url, ref_audio_tmp.name)
@@ -210,9 +182,21 @@ def handler(job):
         temp_files.append(ref_wav_tmp.name)
         convert_to_wav(ref_audio_tmp.name, ref_wav_tmp.name)
 
-        # Chunking
+        # ---- CHUNK DEBUG (so we see overrides instantly) ----
+        print("====== CHUNK DEBUG ======")
+        print(f"text_len={len(text)}")
+        print(f"chunk_max_chars={chunk_max_chars}")
+        print(f"chunk_min_chars={chunk_min_chars}")
+        print(f"remove_silence={remove_silence}")
+        print("=========================")
+
         chunks = chunk_text(text, chunk_max_chars, chunk_min_chars)
+
         print(f"Split text into {len(chunks)} chunks")
+        if chunks:
+            lens_preview = [len(c) for c in chunks[:10]]
+            print(f"chunk_lens(first<=10): {lens_preview}")
+            print(f"chunk_len_min/max: {min(len(c) for c in chunks)}/{max(len(c) for c in chunks)}")
 
         audio_segments = []
         chunk_times = []
@@ -227,11 +211,18 @@ def handler(job):
             with torch.no_grad():
                 if use_cuda:
                     with torch.autocast("cuda", dtype=amp_dtype):
-                        wav = tts_model.generate(text=chunk, audio_prompt_path=ref_wav_tmp.name)
+                        wav = tts_model.generate(
+                            text=chunk,
+                            audio_prompt_path=ref_wav_tmp.name
+                        )
                 else:
-                    wav = tts_model.generate(text=chunk, audio_prompt_path=ref_wav_tmp.name)
+                    wav = tts_model.generate(
+                        text=chunk,
+                        audio_prompt_path=ref_wav_tmp.name
+                    )
 
             audio_segments.append(wav)
+
             dt = time.time() - t0
             chunk_times.append(dt)
             print(f"Chunk {i+1} done in {dt:.2f}s")
@@ -249,9 +240,10 @@ def handler(job):
         buffer.seek(0)
 
         total_time = time.time() - total_start
+        avg_chunk = (sum(chunk_times) / len(chunk_times)) if chunk_times else 0.0
         print("====== TTS SUMMARY ======")
         print(f"Chunks: {len(chunks)}")
-        print(f"Avg chunk time: {sum(chunk_times)/len(chunk_times):.2f}s")
+        print(f"Avg chunk time: {avg_chunk:.2f}s")
         print(f"Total time: {total_time:.2f}s")
         print("=========================")
 
@@ -271,10 +263,6 @@ def handler(job):
             if os.path.exists(f):
                 os.unlink(f)
 
-
-# =========================
-# START
-# =========================
 
 print("Loading Chatterbox TURBO TTS model...")
 load_model()
