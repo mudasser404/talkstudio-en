@@ -7,7 +7,7 @@ import os
 import tempfile
 import urllib.request
 import re
-import time  # ✅ NEW: timing debug
+import time  # timing debug
 
 from huggingface_hub import login
 
@@ -85,26 +85,40 @@ def convert_to_wav(input_path, output_path):
     print(f"Converted to WAV: {output_path}")
 
 
-# ✅ Updated defaults here (max_chars/min_chars)
+# ✅ UPDATED: chunker that fills up to max_chars (instead of tiny sentence chunks)
 def chunk_text(text, max_chars=2000, min_chars=800):
-    """Split text into chunks for processing."""
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    """
+    Split text into chunks that are close to max_chars, preferring sentence boundaries.
+    This drastically reduces the number of chunks for long text (big speed win).
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    n = len(text)
     chunks = []
-    current_chunk = ""
+    start = 0
 
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) <= max_chars:
-            current_chunk += (" " if current_chunk else "") + sentence
-        else:
-            if current_chunk and len(current_chunk) >= min_chars:
-                chunks.append(current_chunk.strip())
-            current_chunk = sentence
+    while start < n:
+        end = min(start + max_chars, n)
 
-    if current_chunk:
-        if len(current_chunk) < min_chars and chunks:
-            chunks[-1] += " " + current_chunk
+        # If we didn't hit the end, try to cut at a sentence boundary near the end
+        if end < n:
+            window = text[start:end]
+            matches = list(re.finditer(r"[.!?]", window))
+            if matches:
+                # choose the last sentence-ending punctuation in the window
+                last_end = matches[-1].end()
+                # only accept it if chunk is big enough
+                if last_end >= min_chars:
+                    end = start + last_end
+
+        chunk = text[start:end].strip()
+
+        # If chunk is too small, merge into previous (avoids tiny tail chunk)
+        if len(chunk) < min_chars and chunks:
+            chunks[-1] = (chunks[-1] + " " + chunk).strip()
         else:
-            chunks.append(current_chunk.strip())
+            chunks.append(chunk)
+
+        start = end
 
     return chunks
 
@@ -138,23 +152,6 @@ def remove_silence_from_audio(waveform, threshold=0.01):
 
 
 def handler(job):
-    """
-    RunPod serverless handler for Chatterbox TURBO TTS.
-
-    Input:
-        - text: Text to synthesize (required)
-        - ref_audio_url: URL to reference audio for voice cloning (required)
-        - remove_silence: Remove silence from output (default: "true")
-        - chunk_max_chars: Max characters per chunk (default: 2000)
-        - chunk_min_chars: Min characters per chunk (default: 800)
-        - pause_s: Pause between chunks in seconds (default: 0.0)
-        - speed: Playback speed multiplier (default: 1)
-        - volume: Volume multiplier (default: 1)
-
-    Output:
-        - audio: Base64 encoded WAV audio
-        - sample_rate: Sample rate of the output audio
-    """
     job_input = job["input"]
 
     text = job_input.get("text")
@@ -167,7 +164,6 @@ def handler(job):
 
     remove_silence = str(job_input.get("remove_silence", "true")).lower() == "true"
 
-    # ✅ Updated defaults here
     chunk_max_chars = int(job_input.get("chunk_max_chars", 2000))
     chunk_min_chars = int(job_input.get("chunk_min_chars", 800))
     pause_s = float(job_input.get("pause_s", 0.0))
@@ -177,12 +173,9 @@ def handler(job):
 
     temp_files = []
 
-    # ✅ NEW: timing (total)
     total_start = time.time()
 
     try:
-        # ❌ Removed torch.cuda.empty_cache() from normal path (keeps allocator warm)
-
         tts_model = load_model()
         sample_rate = tts_model.sr  # 24000
 
@@ -202,7 +195,6 @@ def handler(job):
         chunks = chunk_text(text, chunk_max_chars, chunk_min_chars)
         print(f"Split text into {len(chunks)} chunks")
 
-        # ✅ NEW: chunk timing summary accumulator
         chunk_times = []
 
         # Generate per chunk
@@ -213,50 +205,41 @@ def handler(job):
         use_cuda = torch.cuda.is_available()
         amp_dtype = None
         if use_cuda:
-            # Prefer bf16 if supported, otherwise fp16
             amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         for i, chunk in enumerate(chunks):
-            chunk_start = time.time()  # ✅ NEW: per-chunk timer
+            chunk_start = time.time()
             print(f"Generating chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
 
             with torch.no_grad():
                 if use_cuda:
                     with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                        # ✅ UPDATED: remove unsupported args for Turbo (less overhead / no warnings)
                         wav = tts_model.generate(
                             text=chunk,
-                            audio_prompt_path=ref_wav_temp.name,
-                            exaggeration=0.5,
-                            cfg_weight=0.5
+                            audio_prompt_path=ref_wav_temp.name
                         )
                 else:
                     wav = tts_model.generate(
                         text=chunk,
-                        audio_prompt_path=ref_wav_temp.name,
-                        exaggeration=0.5,
-                        cfg_weight=0.5
+                        audio_prompt_path=ref_wav_temp.name
                     )
 
-            # ✅ Do NOT .cpu() per chunk; keep on device and concatenate first
             audio_segments.append(wav)
 
             if i < len(chunks) - 1 and pause_samples > 0:
-                # If wav is on GPU, move pause to same device for concat
                 audio_segments.append(pause_tensor.to(wav.device))
 
-            chunk_elapsed = time.time() - chunk_start  # ✅ NEW
+            chunk_elapsed = time.time() - chunk_start
             chunk_times.append(chunk_elapsed)
-            print(f"Chunk {i+1} done in {chunk_elapsed:.2f}s")  # ✅ NEW
+            print(f"Chunk {i+1} done in {chunk_elapsed:.2f}s")
 
-        # Concatenate all on the same device
         final_audio = torch.cat(audio_segments, dim=1)
 
-        # Silence trim only once at the end
         if remove_silence:
             final_audio = remove_silence_from_audio(final_audio)
 
         if speed != 1.0:
-            # tempo adjustment requires CPU tensor in torchaudio/sox path
             if final_audio.is_cuda:
                 final_audio = final_audio.cpu()
             final_audio, sample_rate = adjust_audio_speed(final_audio, sample_rate, speed)
@@ -264,7 +247,6 @@ def handler(job):
         if volume != 1.0:
             final_audio = adjust_audio_volume(final_audio, volume)
 
-        # One .cpu() transfer at the end (needed for torchaudio.save to buffer)
         if final_audio.is_cuda:
             final_audio = final_audio.cpu()
 
@@ -275,7 +257,6 @@ def handler(job):
 
         print(f"Generated audio: {final_audio.shape[1] / sample_rate:.2f} seconds")
 
-        # ✅ NEW: timing summary
         total_elapsed = time.time() - total_start
         avg_chunk = (sum(chunk_times) / len(chunk_times)) if chunk_times else 0.0
         print("====== TTS TIMING SUMMARY ======")
@@ -291,7 +272,6 @@ def handler(job):
         tb = traceback.format_exc()
         print(f"Error: {str(e)}\n{tb}")
 
-        # Optional: clear cache on error only
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -303,7 +283,6 @@ def handler(job):
                 os.unlink(f)
 
 
-# Pre-load model on cold start
 print("Loading Chatterbox TURBO TTS model...")
 try:
     load_model()
